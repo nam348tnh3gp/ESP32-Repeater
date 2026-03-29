@@ -126,7 +126,7 @@ This firmware is designed for **24/7 stable operation** under constrained hardwa
 
 ### Default Access Point
 
-* SSID: `APEX_CORE`
+* SSID: `APEX_PRO`
 * Password: `12345678`
 * IP: `192.168.4.1`
 
