@@ -1,22 +1,26 @@
-# 🛡️ ESP32 NAT Router – V16 (APEX KERNEL)
-
-**Category:** Secure Embedded Network OS
-**Platform:** ESP32 (Dual-Core)
-**Architecture:** SMP-aware RTOS + lwIP NAT (NAPT)
-
----
-
-## 🚀 Overview
-
-**APEX KERNEL V16** is a high-performance, security-focused NAT router firmware for ESP32.
-It transforms a single ESP32 board into a **WiFi repeater / access point with NAT**, complete with:
-
-* 🔐 Token-based secure control plane
-* ⚡ Real-time WebSocket telemetry dashboard
-* 🧠 Memory-aware NAT lifecycle management
-* 🛡️ Active rate limiting & watchdog protection
-
-This firmware is designed for **24/7 stable operation** under constrained hardware conditions.
+🛡️ ESP32 NAT Router – V18 (APEX PRODUCTION)
+Category: Secure Embedded Network OS
+Platform: ESP32 (Dual-Core)
+Architecture: SMP-aware RTOS + lwIP NAT (NAPT)
+📝 Supported Boards
+This firmware has been tested and verified on the following ESP32 boards:
+ESP32-WROOM-32 (standard Dev Module)
+ESP32-WROOM-32U (external antenna version)
+ESP32-WROOM-32D
+ESP32-WROOM-32E
+ESP32-S2 / S3 (limited testing, adjust NAT slots)
+ESP32-PICO-D4
+⚠️ Notes:
+Some boards with very limited RAM (< 320KB free heap) may experience NAT table purges more frequently.
+For ESP32-S2/S3, dual-core task assignment may need minor tweaks for network task pinning.
+🚀 Overview
+APEX KERNEL V16 is a high-performance, security-focused NAT router firmware for ESP32.
+It transforms a single ESP32 board into a WiFi repeater / access point with NAT, complete with:
+🔐 Token-based secure control plane
+⚡ Real-time WebSocket telemetry dashboard
+🧠 Memory-aware NAT lifecycle management
+🛡️ Active rate limiting & watchdog protection
+This firmware is designed for 24/7 stable operation under constrained hardware conditions.
 
 ---
 
