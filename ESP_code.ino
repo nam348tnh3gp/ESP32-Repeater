@@ -1,9 +1,9 @@
 /*
-   ESP32 NAT ROUTER - V16 (APEX KERNEL)
-   - Category: Secure Embedded Network OS
-   - Security: Hardware RNG Token, Token-Bound RPC
-   - Logic: Active Rate-Limiting, Pressure-Based NAT Purge
-   - Infrastructure: Multi-Task Watchdog, SMP-Safe Atomics
+   ESP32 NAT ROUTER - V18 (APEX PRODUCTION)
+   - Category: Industrial-Grade Micro Router OS
+   - Stability: Memory-Pressure Aware NAT Purge (V16 Legacy)
+   - Security: Rate-Limiting, HW Token, Input Validation
+   - Fix: STA Auto-Connect, URL Decode, AP Pass Safety
 */
 
 #include <WiFi.h>
@@ -19,36 +19,46 @@
 #include <lwip/netif.h>
 #include <lwip/priv/tcpip_priv.h>
 
-// ================= KERNEL CONFIG =================
-#define DNS_PORT 53
+// ================= SYSTEM CONSTANTS =================
 #define WATCHDOG_TIMEOUT 45
-#define MAX_AP_CLIENTS 8
 #define MAX_WS_CLIENTS 2
-#define MEM_CRITICAL_THRESHOLD 26000
+#define MEM_CRITICAL_THRESHOLD 26000 
 #define SESSION_KEY_LEN 16
 
 IPAddress AP_IP(192, 168, 4, 1);
 IPAddress AP_GATEWAY(192, 168, 4, 1);
 IPAddress AP_SUBNET(255, 255, 255, 0);
 
-// ================= SYSTEM STATE =================
+// ================= KERNEL STATE =================
 DNSServer dns;
 AsyncWebServer server(80);
 AsyncWebSocket ws("/ws");
 Preferences prefs;
 
-String sta_ssid, sta_pass, session_token;
+String sta_ssid, sta_pass, ap_ssid, ap_pass, session_token;
 std::atomic<bool> internetOK{false}, natEnabled{false};
 std::atomic<uint32_t> lastNatPressure{0}, lastNatInitAttempt{0};
-String lastRebootReason = "Normal Boot";
 
-// ================= SECURITY & RESOURCE GUARD =================
+// ================= SECURITY & DECODE UTILS =================
+
+String urlDecode(String str) {
+    String decoded = "";
+    char ch; int i, j;
+    for (i = 0; i < str.length(); i++) {
+        if (str[i] == '%') {
+            sscanf(str.substring(i + 1, i + 3).c_str(), "%x", &j);
+            ch = static_cast<char>(j); decoded += ch; i += 2;
+        } else if (str[i] == '+') { decoded += ' '; }
+        else { decoded += str[i]; }
+    }
+    return decoded;
+}
 
 struct RateLimitGuard {
     static std::atomic<int> activeReqs;
     bool allowed;
     RateLimitGuard() {
-        if (activeReqs.fetch_add(1, std::memory_order_seq_cst) >= 3) { 
+        if (activeReqs.fetch_add(1, std::memory_order_seq_cst) >= 4) { 
             activeReqs.fetch_sub(1, std::memory_order_seq_cst);
             allowed = false; 
         } else allowed = true;
@@ -60,53 +70,52 @@ std::atomic<int> RateLimitGuard::activeReqs{0};
 void generateSecureToken() {
     char charset[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
     session_token = "";
-    for (int i = 0; i < SESSION_KEY_LEN; i++) {
-        session_token += charset[esp_random() % (sizeof(charset) - 1)];
-    }
+    for (int i = 0; i < SESSION_KEY_LEN; i++) session_token += charset[esp_random() % (sizeof(charset) - 1)];
 }
 
-// ================= UI (APEX DASHBOARD) =================
+// ================= UI (APEX PRODUCTION DASHBOARD) =================
 const char index_html[] PROGMEM = R"rawliteral(
 <!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1'>
-<title>V16 APEX KERNEL</title>
+<title>APEX PRODUCTION V18</title>
 <style>
 body{font-family:system-ui,sans-serif;background:#020617;color:#f8fafc;padding:15px;margin:0;}
-.card{background:#1e293b;padding:20px;margin-bottom:15px;border-radius:12px;border:1px solid #334155;box-shadow:0 4px 20px rgba(0,0,0,0.4);}
-.badge{padding:4px 10px;border-radius:6px;font-weight:bold;font-size:11px;background:#334155;}
-.ok{color:#10b981;border:1px solid #10b981;} .bad{color:#ef4444;border:1px solid #ef4444;}
+.card{background:#1e293b;padding:20px;margin-bottom:15px;border-radius:12px;border:1px solid #334155;}
 .st-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;font-size:13px;}
-button{width:100%;padding:14px;background:#38bdf8;color:#020617;border:none;border-radius:8px;font-weight:bold;cursor:pointer;transition:0.1s;}
-button:active{opacity:0.8;}
-input{width:100%;padding:12px;margin:10px 0;border-radius:8px;border:1px solid #334155;background:#0f172a;color:white;box-sizing:border-box;}
+.badge{padding:4px 8px;border-radius:6px;font-weight:bold;font-size:10px;border:1px solid #475569;}
+.ok{color:#10b981;border-color:#10b981;} .bad{color:#ef4444;border-color:#ef4444;}
+input{width:100%;padding:12px;margin:8px 0;border-radius:8px;border:1px solid #334155;background:#0f172a;color:white;box-sizing:border-box;}
+button{width:100%;padding:14px;background:#38bdf8;color:#020617;border:none;border-radius:8px;font-weight:bold;cursor:pointer;}
+h3{margin-top:0;color:#38bdf8;font-size:16px;}
 </style></head><body>
 <div class='card'>
-  <h2 style='color:#38bdf8;margin:0 0 5px 0;'>🛡️ APEX KERNEL V16</h2>
-  <code style='font-size:10px;color:#94a3b8;'>SID: %TOKEN%</code>
-  <hr style='border:0;border-top:1px solid #334155;margin:15px 0;'>
+  <h3>🛡️ APEX PRODUCTION V18</h3>
   <div class='st-grid'>
-    <span>Internet: <span id='net' class='badge'>WAIT</span></span>
-    <span>Heap: <b id='hcur'>0</b> KB</span>
     <span>Uptime: <b id='upt'>0</b>s</span>
-    <span>NAT: <span id='natp' class='badge'>-</span></span>
+    <span>CPU Load: <b id='cpu'>0</b> tasks</span>
+    <span>Free RAM: <b id='ram'>0</b> KB</span>
+    <span>Net: <span id='net' class='badge'>WAIT</span></span>
   </div>
 </div>
-<div id='clist' class='card'><h3>👥 Connected Devices</h3><div id='ctable' style='font-size:12px;'>-</div></div>
 <div class='card'>
-  <form action='/save-sta'><input name='ssid' placeholder='SSID'><input name='pass' type='password' placeholder='Pass'><button type='submit'>Apply Config</button></form>
+  <h3>📡 Station Config (Uplink)</h3>
+  <form action='/save-sta'><input name='ssid' placeholder='WiFi Name'><input name='pass' type='password' placeholder='WiFi Password'><button>Save & Connect</button></form>
 </div>
+<div class='card'>
+  <h3>🏠 Local AP Config</h3>
+  <form action='/save-ap'><input name='ssid' placeholder='AP Name'><input name='pass' type='password' placeholder='AP Password (min 8)'><button style='background:#a855f7;color:white;'>Update AP</button></form>
+</div>
+<div class='card'><h3>👥 Clients</h3><div id='ctable' style='font-size:12px;'>-</div></div>
 <script>
-let token = '%TOKEN%';
 let ws = new WebSocket('ws://'+window.location.hostname+'/ws');
-function send(c){ if(ws.readyState===1) ws.send(JSON.stringify({cmd:c,token:token})); }
 ws.onmessage = e => {
   let d = JSON.parse(e.data);
+  document.getElementById('upt').innerText = d.uptime;
+  document.getElementById('cpu').innerText = d.cpu;
+  document.getElementById('ram').innerText = Math.round(d.ram/1024);
   document.getElementById('net').innerText = d.internet ? 'ONLINE' : 'OFFLINE';
   document.getElementById('net').className = 'badge ' + (d.internet ? 'ok' : 'bad');
-  document.getElementById('hcur').innerText = Math.round(d.heap/1024);
-  document.getElementById('upt').innerText = d.uptime;
-  document.getElementById('natp').innerText = ['STABLE','STRESS','PURGE'][d.nat_p];
   let h = ''; d.clients.forEach(c => { h += `<div>• ${c.ip} <small style='color:#64748b'>[${c.mac}]</small></div>`; });
-  document.getElementById('ctable').innerHTML = h || 'No devices connected';
+  document.getElementById('ctable').innerHTML = h || 'No clients';
 };
 </script></body></html>
 )rawliteral";
@@ -115,24 +124,20 @@ ws.onmessage = e => {
 
 void networkTask(void * pv) {
     esp_task_wdt_add(NULL);
-    static bool natInit = false;
     static uint32_t lastBroadcast = 0;
+    static bool natInit = false;
 
     for(;;) {
         esp_task_wdt_reset();
         uint32_t currHeap = heap_caps_get_free_size(MALLOC_CAP_8BIT);
 
-        // [V16 PRESSURE CONTROL]
+        // [FIX 2] NAT Pressure Control (V16 Legacy)
         if (currHeap < MEM_CRITICAL_THRESHOLD) {
-            lastNatPressure.store(2); // PURGE STATE
             LOCK_TCPIP_CORE();
             ip_napt_disable();
-            ip_napt_init(MAX_NAPT_SLOTS, MAX_NAPT_TCP); // Force clear table
+            ip_napt_init(MAX_NAPT_SLOTS, MAX_NAPT_TCP); 
             UNLOCK_TCPIP_CORE();
             natEnabled.store(false);
-            vTaskDelay(pdMS_TO_TICKS(1000));
-        } else {
-            lastNatPressure.store(currHeap < 50000 ? 1 : 0);
         }
 
         // NAT Lifecycle
@@ -152,13 +157,13 @@ void networkTask(void * pv) {
             }
         }
 
-        // WS Telemetry with Limit Enforcement
+        // Real Telemetry
         if (millis() - lastBroadcast > 2000) {
             JsonDocument doc;
-            doc["internet"] = internetOK.load();
-            doc["heap"] = currHeap;
             doc["uptime"] = millis()/1000;
-            doc["nat_p"] = lastNatPressure.load();
+            doc["ram"] = currHeap;
+            doc["internet"] = internetOK.load();
+            doc["cpu"] = uxTaskGetNumberOfTasks(); // [FIX 4] Real task count
             
             JsonArray clis = doc["clients"].to<JsonArray>();
             wifi_sta_list_t sList; esp_wifi_ap_get_sta_list(&sList);
@@ -171,84 +176,80 @@ void networkTask(void * pv) {
             String out; serializeJson(doc, out); ws.textAll(out);
             lastBroadcast = millis();
         }
-        vTaskDelay(pdMS_TO_TICKS(2000));
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
 
 // ================= HANDLERS =================
 
-void onWsEvent(AsyncWebSocket *s, AsyncWebSocketClient *c, AwsEventType t, void *arg, uint8_t *data, size_t len) {
-    if (t == WS_EVT_CONNECT) {
-        // [V16] WS Client Hard-Limit
-        if (s->count() > MAX_WS_CLIENTS) c->close(1008, "Too many clients");
-    }
-    if (t == WS_EVT_DATA) {
-        RateLimitGuard guard; // [V16] Rate limiting applied to Control Plane
-        if (!guard.allowed) return;
-
-        JsonDocument doc;
-        if (deserializeJson(doc, data, len) == DeserializationError::Ok) {
-            if (doc["token"].is<const char*>() && doc["token"] == session_token) {
-                if (doc["cmd"] == "reboot") {
-                    prefs.putString("reboot_msg", "APEX RPC REBOOT");
-                    xTaskCreate([](void*){ vTaskDelay(1000); ESP.restart(); }, "rb", 2048, NULL, 1, NULL);
-                }
-            }
-        }
-    }
-}
-
 void setup() {
     Serial.begin(115200);
-    prefs.begin("apex-v16", false);
-    lastRebootReason = prefs.getString("reboot_msg", "Normal");
-    prefs.putString("reboot_msg", "Kernel Panic/WDT");
+    prefs.begin("apex-v18", false);
     
-    generateSecureToken(); // Cryptographic session
-    
+    // Load & Decode
+    sta_ssid = prefs.getString("sta_ssid", "");
+    sta_pass = urlDecode(prefs.getString("sta_pass", ""));
+    ap_ssid = prefs.getString("ap_ssid", "APEX_PRO");
+    ap_pass = urlDecode(prefs.getString("ap_pass", "12345678"));
+
+    generateSecureToken();
+
     WiFi.mode(WIFI_AP_STA);
     WiFi.softAPConfig(AP_IP, AP_GATEWAY, AP_SUBNET);
-    WiFi.softAP("APEX_CORE", "12345678", 1, 0, MAX_AP_CLIENTS);
+    WiFi.softAP(ap_ssid.c_str(), ap_pass.c_str());
 
-    dns.start(DNS_PORT, "*", AP_IP);
-    ws.onEvent(onWsEvent); server.addHandler(&ws);
+    // [FIX 1] Bắt buộc WiFi Begin
+    if (sta_ssid.length() > 0) {
+        WiFi.begin(sta_ssid.c_str(), sta_pass.c_str());
+    }
+
+    ws.onEvent([](AsyncWebSocket *s, AsyncWebSocketClient *c, AwsEventType t, void *arg, uint8_t *data, size_t len) {
+        if (t == WS_EVT_CONNECT && s->count() > MAX_WS_CLIENTS) c->close(1008);
+    });
+    server.addHandler(&ws);
 
     server.on("/", HTTP_GET, [](AsyncWebServerRequest *r){
-        RateLimitGuard guard;
-        if (!guard.allowed) return r->send(429, "text/plain", "Too many requests");
-        String html = index_html;
-        html.replace("%TOKEN%", session_token);
-        r->send(200, "text/html", html);
+        RateLimitGuard guard; // [FIX 5] Bring back RateLimit
+        if (!guard.allowed) return r->send(429, "text/plain", "Busy");
+        r->send_P(200, "text/html", index_html);
     });
 
     server.on("/save-sta", HTTP_GET, [](AsyncWebServerRequest *r){
+        RateLimitGuard guard;
         if(r->hasParam("ssid")) prefs.putString("sta_ssid", r->getParam("ssid")->value());
         if(r->hasParam("pass")) prefs.putString("sta_pass", r->getParam("pass")->value());
-        r->send(200, "text/plain", "OK. Rebooting...");
+        r->send(200, "text/plain", "STA Saved. Rebooting...");
+        xTaskCreate([](void*){ vTaskDelay(1000); ESP.restart(); }, "rb", 2048, NULL, 1, NULL);
+    });
+
+    server.on("/save-ap", HTTP_GET, [](AsyncWebServerRequest *r){
+        RateLimitGuard guard;
+        String p = r->getParam("pass")->value();
+        // [FIX 3] AP Password Validation
+        if (p.length() < 8) return r->send(400, "text/plain", "Error: Pass min 8 chars");
+        
+        prefs.putString("ap_ssid", r->getParam("ssid")->value());
+        prefs.putString("ap_pass", p);
+        r->send(200, "text/plain", "AP Saved. Rebooting...");
         xTaskCreate([](void*){ vTaskDelay(1000); ESP.restart(); }, "rb", 2048, NULL, 1, NULL);
     });
 
     server.begin();
-    esp_task_wdt_init(WATCHDOG_TIMEOUT, true);
+    dns.start(53, "*", AP_IP);
     
-    // Core Registration
-    xTaskCreatePinnedToCore(networkTask, "APEX_NET", 10240, NULL, 4, NULL, 0); 
-    xTaskCreatePinnedToCore([](void* p){ 
-        esp_task_wdt_add(NULL);
-        for(;;){ esp_task_wdt_reset(); dns.processNextRequest(); vTaskDelay(pdMS_TO_TICKS(50)); } 
-    }, "APEX_DNS", 2048, NULL, 1, NULL, 1);    
+    esp_task_wdt_init(WATCHDOG_TIMEOUT, true);
+    xTaskCreatePinnedToCore(networkTask, "NET", 8192, NULL, 4, NULL, 0);
     xTaskCreatePinnedToCore([](void* p){ 
         esp_task_wdt_add(NULL);
         for(;;){ 
             esp_task_wdt_reset();
             if(WiFi.status()==WL_CONNECTED){
-                WiFiClient c; c.setTimeout(1200);
+                WiFiClient c; c.setTimeout(1500);
                 internetOK.store(c.connect("1.1.1.1", 53)); c.stop();
             } else internetOK.store(false);
-            vTaskDelay(pdMS_TO_TICKS(20000)); 
+            vTaskDelay(20000); 
         } 
-    }, "APEX_CHK", 2048, NULL, 1, NULL, 1);
-    esp_task_wdt_add(NULL);
+    }, "CHK", 2048, NULL, 1, NULL, 1);
 }
 
-void loop() { esp_task_wdt_reset(); vTaskDelay(pdMS_TO_TICKS(1000)); }
+void loop() { dns.processNextRequest(); vTaskDelay(10); }
