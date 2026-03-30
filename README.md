@@ -1,4 +1,4 @@
-# 🛡️ ESP32 NAT Router – V18 (APEX PRODUCTION)
+# 🛡️ ESP32 NAT Router – V19.9.7 (APEX ULTRA)
 
 **Category:** Secure Embedded Network OS
 **Platform:** ESP32 (Dual-Core)
@@ -126,7 +126,7 @@ This firmware is designed for **24/7 stable operation** under constrained hardwa
 
 ### Default Access Point
 
-* SSID: `APEX_PRO`
+* SSID: `APEX_ULTRA`
 * Password: `12345678`
 * IP: `192.168.4.1`
 
@@ -170,7 +170,7 @@ This firmware is designed for **24/7 stable operation** under constrained hardwa
 
 ## 🌍 Usage
 
-1. Connect to WiFi: `APEX_PRO`
+1. Connect to WiFi: `APEX_ULTRA`
 2. Open browser:
 
    ```
