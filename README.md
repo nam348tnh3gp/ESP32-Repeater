@@ -30,7 +30,7 @@ This firmware has been tested and verified on the following ESP32 boards:
 
 ## 🚀 Overview
 
-**APEX KERNEL V16** is a high-performance, security-focused NAT router firmware for ESP32.
+**APEX KERNEL V19.9.7** is a high-performance, security-focused NAT router firmware for ESP32.
 It transforms a single ESP32 board into a **WiFi repeater / access point with NAT**, complete with:
 
 * 🔐 Token-based secure control plane
