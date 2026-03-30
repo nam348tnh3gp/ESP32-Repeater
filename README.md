@@ -170,7 +170,7 @@ This firmware is designed for **24/7 stable operation** under constrained hardwa
 
 ## 🌍 Usage
 
-1. Connect to WiFi: `APEX_CORE`
+1. Connect to WiFi: `APEX_PRO`
 2. Open browser:
 
    ```
