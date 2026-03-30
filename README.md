@@ -1,3 +1,7 @@
+[![Platform: ESP32](https://img.shields.io/badge/Platform-ESP32-blue)](https://www.espressif.com/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
+[![Version](https://img.shields.io/badge/Version-19.9.7-orange)](https://github.com/nam348tnh3gp/ESP32-Repeater)
+[![Arduino](https://img.shields.io/badge/Arduino-ESP32-cyan)](https://www.arduino.cc/)
 # 🛡️ ESP32 NAT Router – V19.9.7 (APEX ULTRA)
 
 **Category:** Secure Embedded Network OS
