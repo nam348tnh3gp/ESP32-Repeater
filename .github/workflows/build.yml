@@ -1,43 +1,38 @@
-name: Build ESP32-C5 Firmware
+name: Build ESP32-C5 Firmware with Docker (Arduino CLI)
 
 on:
   push:
+    branches: [ main, master ]
+  pull_request:
     branches: [ main, master ]
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-      
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-      
-      - name: Install PlatformIO
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        run: docker build -t esp32c5-builder .
+
+      - name: Run container to compile
+        run: docker run --name builder esp32c5-builder
+
+      - name: Copy firmware from container
         run: |
-          pip install --upgrade pip
-          pip install platformio
-      
-      - name: Update PlatformIO
-        run: pio upgrade
-      
-      - name: Build firmware
-        run: pio run -e esp32-c5-devkitc-1
-      
-      - name: List build artifacts
-        run: ls -la .pio/build/esp32-c5-devkitc-1/
-      
-      - name: Upload firmware
+          mkdir -p artifacts
+          docker cp builder:/firmware/ESP_Code/build/ ./artifacts/
+          docker rm builder
+
+      - name: Upload firmware artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: esp32-c5-firmware
-          path: |
-            .pio/build/esp32-c5-devkitc-1/firmware.bin
-            .pio/build/esp32-c5-devkitc-1/bootloader.bin
-            .pio/build/esp32-c5-devkitc-1/partitions.bin
-          retention-days: 30
+          name: esp32c5-firmware
+          path: artifacts/build/*.bin
+          retention-days: 90
