@@ -1,4 +1,4 @@
-name: APEX-ULTRA-Final-Fix
+name: APEX-ULTRA-Universal-Build
 
 on:
   push:
@@ -14,8 +14,11 @@ jobs:
         include:
           - id: "ESP32_Standard"
             target: "esp32"
+            flash: "4MB"
           - id: "ESP32_S3_N16R8"
             target: "esp32s3"
+            flash: "16MB"
+            psram: "opi"
 
     steps:
       - name: Checkout Code
@@ -27,35 +30,39 @@ jobs:
           esp_idf_version: v5.1
           target: ${{ matrix.target }}
           command: |
-            # 1. Dọn dẹp môi trường build
+            # 1. Dọn dẹp tuyệt đối để tránh cache lỗi
             rm -rf components build dependencies.lock
             mkdir -p components
             
-            # 2. Clone Arduino core (Dùng lệnh clone tường minh để tránh lỗi resolve)
+            # 2. Clone Arduino core (Dùng nhánh v5.1 để tương thích hoàn hảo)
             git clone --branch esp-idf-v5.1-libs --depth 1 https://github.com/espressif/arduino-esp32.git components/arduino-esp32
             
-            # 3. Cập nhật submodules cho Arduino (BẮT BUỘC để có đủ driver)
-            cd components/arduino-esp32
-            git submodule update --init --recursive --depth 1
-            cd ../..
+            # 3. Cập nhật submodules (Rất quan trọng để tránh thiếu header)
+            cd components/arduino-esp32 && git submodule update --init --recursive --depth 1 && cd ../..
             
-            # 4. Clone các thư viện mạng
+            # 4. Tải các thư viện WebServer và JSON
             git clone --depth 1 https://github.com/me-no-dev/AsyncTCP.git components/AsyncTCP
             git clone --depth 1 https://github.com/me-no-dev/ESPAsyncWebServer.git components/ESPAsyncWebServer
             git clone --depth 1 https://github.com/bblanchon/ArduinoJson.git components/ArduinoJson
 
-            # 5. Kiểm tra sự tồn tại của thư mục (Log sẽ hiện ở đây)
-            ls -d components/*/ 
+            # 5. Debug: Kiểm tra xem các file CMake có ở đúng chỗ không
+            ls -l CMakeLists.txt main/CMakeLists.txt
+            ls -d components/*/
 
-            # 6. Tạo file cấu hình mặc định
+            # 6. Cấu hình SDK
             echo "CONFIG_AUTOSTART_ARDUINO=y" > sdkconfig.defaults
             echo "CONFIG_LWIP_IPV4_NAPT=y" >> sdkconfig.defaults
-            echo "CONFIG_LWIP_IP_FORWARD=y" >> sdkconfig.defaults
+            
+            if [ "${{ matrix.flash }}" = "16MB" ]; then
+              echo "CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y" >> sdkconfig.defaults
+              echo "CONFIG_SPIRAM=y" >> sdkconfig.defaults
+              echo "CONFIG_SPIRAM_MODE_OCT=y" >> sdkconfig.defaults
+            fi
 
             # 7. Biên dịch
             idf.py build
             
-            # 8. Di chuyển file đầu ra
+            # 8. Đổi tên file đầu ra
             if [ -f build/APEX_ULTRA.bin ]; then
               mv build/APEX_ULTRA.bin build/APEX_${{ matrix.id }}.bin
             fi
