@@ -1,10 +1,11 @@
 /*
-   ESP32 NAT ROUTER - V19.9.7 (APEX ULTRA - Full Mobile Support)
+   ESP32 NAT ROUTER - V19.9.7 (ESP32-C5 SUPPORT)
    - Full iOS & Android compatibility
    - Captive Portal with iOS detection
    - WebSocket auto-reconnect & heartbeat
    - Mobile-optimized UI (font-size: 16px for inputs)
    - Cross-platform form validation
+   - MODIFIED FOR ESP32-C5 (RISC-V)
 */
 
 #include <WiFi.h>
@@ -16,12 +17,22 @@
 #include <esp_task_wdt.h>
 #include <esp_wifi.h>
 #include <esp_netif.h>
-#include <esp_temp_sensor.h>
 #include <atomic>
 #include <lwip/napt.h>
 #include <lwip/netif.h>
 #include <lwip/priv/tcpip_priv.h>
 #include <lwip/etharp.h>
+
+// ================= ESP32-C5 COMPATIBILITY DEFINES =================
+// ESP32-C5 không có cảm biến nhiệt độ tích hợp
+#if CONFIG_IDF_TARGET_ESP32C5
+#define ESP32C5_BOARD 1
+#endif
+
+// LED_BUILTIN cho ESP32-C5 (thường là GPIO 2 trên DevKit)
+#ifndef LED_BUILTIN
+#define LED_BUILTIN 2
+#endif
 
 // ================= KERNEL DEFINITIONS =================
 #define MAX_NAPT_SLOTS 2048
@@ -109,13 +120,19 @@ String validateAPPassword(String pwd) {
     return pwd;
 }
 
-// ================= TEMPERATURE (Fixed-point, atomic-safe) =================
+// ================= TEMPERATURE (ESP32-C5 compatible) =================
+// ESP32-C5 không có cảm biến nhiệt độ tích hợp, luôn trả về 0
 float getTemperature() {
+#ifdef ESP32C5_BOARD
+    // ESP32-C5: không có cảm biến nhiệt độ
+    return 0.0f;
+#else
     float temp;
     if (temp_sensor_read_celsius(&temp) == ESP_OK) {
         return temp;
     }
-    return 0;
+    return 0.0f;
+#endif
 }
 
 // ================= RECONFIGURE AP =================
@@ -163,7 +180,7 @@ struct netif* getAPNetif() {
     if (ap_esp_netif != NULL) {
         return esp_netif_get_netif_impl(ap_esp_netif);
     }
-    
+
     struct netif *netif_ap = netif_list;
     while (netif_ap != NULL) {
         if ((netif_ap->name[0] == 'a' && netif_ap->name[1] == 'p') ||
@@ -178,11 +195,11 @@ struct netif* getAPNetif() {
 String getIPFromMAC(uint8_t* mac) {
     struct netif *netif_ap = getAPNetif();
     if (netif_ap == NULL) return "No AP Netif";
-    
+
     struct eth_addr mac_addr;
     memcpy(mac_addr.addr, mac, ETH_HWADDR_LEN);
     ip4_addr_t *ip_found = NULL;
-    
+
     LOCK_TCPIP_CORE();
     for (int i = 0; i < ARP_TABLE_SIZE; i++) {
         struct etharp_entry *entry = &arp_table[i];
@@ -194,7 +211,7 @@ String getIPFromMAC(uint8_t* mac) {
         }
     }
     UNLOCK_TCPIP_CORE();
-    
+
     if (ip_found != NULL) {
         char ip_str[16];
         ip4addr_ntoa_r(ip_found, ip_str, sizeof(ip_str));
@@ -307,10 +324,10 @@ let wsHeartbeat = null;
 
 function connectWebSocket() {
     if (ws && ws.readyState === WebSocket.OPEN) return;
-    
+
     try {
         ws = new WebSocket('ws://' + window.location.hostname + '/ws');
-        
+
         ws.onopen = function() {
             console.log('✅ WebSocket connected');
             wsRetryCount = 0;
@@ -321,7 +338,7 @@ function connectWebSocket() {
                 }
             }, 15000);
         };
-        
+
         ws.onclose = function() {
             console.log('⚠️ WebSocket disconnected');
             if (wsHeartbeat) clearInterval(wsHeartbeat);
@@ -330,11 +347,11 @@ function connectWebSocket() {
                 setTimeout(connectWebSocket, 2000 * wsRetryCount);
             }
         };
-        
+
         ws.onerror = function(e) {
             console.log('❌ WebSocket error:', e);
         };
-        
+
         ws.onmessage = function(e) {
             let d = JSON.parse(e.data);
             document.getElementById('ram').innerText = Math.round(d.ram/1024);
@@ -347,10 +364,10 @@ function connectWebSocket() {
             document.getElementById('rs').innerText = d.rssi;
             document.getElementById('clientCount').innerText = d.clientCount;
             document.getElementById('clientLimit').innerText = d.clientLimit;
-            
+
             let b = ''; for(let i=1;i<=4;i++) b += `<div class='sig-bar ${i<=d.bars?"act":""}' style='height:${i*3}px'></div>`;
             document.getElementById('bars').innerHTML = b;
-            
+
             let h = ''; d.clients.forEach(c => { 
                 let pendingClass = c.ip === 'Pending...' ? 'pending' : '';
                 h += `<div>• <b class='${pendingClass}'>${c.ip}</b> <small style='color:#64748b'>[${c.mac}]</small></div>`; 
@@ -384,28 +401,28 @@ function validateAPForm() {
     let password = document.getElementById('apPass').value;
     let channel = parseInt(document.getElementById('apChannel').value);
     let maxClients = parseInt(document.getElementById('apMaxClients').value);
-    
+
     errorDiv.style.display = 'none';
     successDiv.style.display = 'none';
-    
+
     if(password.length > 0 && password.length < 8) {
         errorDiv.innerText = '❌ Password must be at least 8 characters (or leave empty to keep current)';
         errorDiv.style.display = 'block';
         return false;
     }
-    
+
     if(isNaN(channel) || channel < 1 || channel > 13) {
         errorDiv.innerText = '❌ Channel must be between 1 and 13';
         errorDiv.style.display = 'block';
         return false;
     }
-    
+
     if(isNaN(maxClients) || maxClients < 1 || maxClients > 10) {
         errorDiv.innerText = '❌ Max clients must be between 1 and 10';
         errorDiv.style.display = 'block';
         return false;
     }
-    
+
     successDiv.innerText = '✅ Settings validated! Rebooting...';
     successDiv.style.display = 'block';
     return true;
@@ -417,7 +434,7 @@ document.getElementById('scanBtn').onclick = async () => {
     if(btn.innerText.includes('Scanning')) return;
     btn.innerText = '⏳ Scanning...';
     btn.classList.add('scanning');
-    
+
     try {
         let r = await fetch('/scan');
         let nets = await r.json();
@@ -436,7 +453,7 @@ document.getElementById('scanBtn').onclick = async () => {
         };
         xhr.send();
     }
-    
+
     btn.innerText = '🔍 Scan WiFi Networks';
     btn.classList.remove('scanning');
 };
@@ -455,39 +472,39 @@ void handleScan(AsyncWebServerRequest *r) {
         r->send(429, "application/json", "[]");
         return;
     }
-    
+
     WiFi.scanNetworks(true);
     int n = -1;
     int timeout = 8000;
     int elapsed = 0;
-    
+
     while (n == -1 && elapsed < timeout) {
         delay(100);
         n = WiFi.scanComplete();
         elapsed += 100;
         esp_task_wdt_reset();
     }
-    
+
     if (n == -2 || n <= 0) {
         WiFi.scanDelete();
         scanInProgress.store(false);
         r->send(500, "application/json", "[]");
         return;
     }
-    
+
     JsonDocument doc;
     JsonArray array = doc.to<JsonArray>();
-    
+
     int limit = (n > MAX_SCAN_NETWORKS) ? MAX_SCAN_NETWORKS : n;
     for (int i = 0; i < limit; i++) {
         JsonObject item = array.add<JsonObject>();
         item["ssid"] = WiFi.SSID(i);
         item["rssi"] = WiFi.RSSI(i);
     }
-    
+
     String out;
     serializeJson(doc, out);
-    
+
     WiFi.scanDelete();
     scanInProgress.store(false);
     r->send(200, "application/json", out);
@@ -553,20 +570,20 @@ void networkTask(void * pv) {
             doc["uptime"] = (millis() - uptimeStart) / 1000;
             doc["clientCount"] = currentClients.load();
             doc["clientLimit"] = max_clients;
-            
+
             int r = lastRSSI.load();
             doc["bars"] = (r > -55) ? 4 : (r > -65) ? 3 : (r > -75) ? 2 : (r > -85) ? 1 : 0;
-            
+
             JsonArray clis = doc["clients"].to<JsonArray>();
-            
+
             wifi_sta_list_t wifi_sta_list;
             esp_wifi_ap_get_sta_list(&wifi_sta_list);
-            
+
             if (lastClientCount != wifi_sta_list.num) {
                 lastClientCount = wifi_sta_list.num;
                 Serial.printf("📡 Clients: %d/%d connected\n", lastClientCount, max_clients);
             }
-            
+
             for (int i = 0; i < wifi_sta_list.num; i++) {
                 JsonObject c = clis.add<JsonObject>();
                 char m[18]; 
@@ -577,7 +594,7 @@ void networkTask(void * pv) {
                 c["mac"] = m;
                 c["ip"] = getIPFromMAC(wifi_sta_list.sta[i].mac);
             }
-            
+
             String out; 
             serializeJson(doc, out); 
             ws.textAll(out);
@@ -593,7 +610,7 @@ void setup() {
     delay(100);
     uptimeStart = millis();
     prefs.begin("apex-v19", false);
-    
+
     // Load configurations with validation
     sta_ssid = prefs.getString("sta_ssid", "");
     sta_pass = urlDecode(prefs.getString("sta_pass", ""));
@@ -605,22 +622,24 @@ void setup() {
     dns_mode = prefs.getInt("dns_mode", DEFAULT_DNS_MODE);
 
     Serial.println("\n╔════════════════════════════════════════╗");
-    Serial.println("║   APEX ULTRA V19.9.7 - Full Mobile  ║");
+    Serial.println("║   APEX ULTRA V19.9.7 - ESP32-C5     ║");
     Serial.println("║   iOS & Android Compatible          ║");
     Serial.println("║   WebSocket Auto-Reconnect          ║");
     Serial.println("╚════════════════════════════════════════╝\n");
 
-    // Initialize temperature sensor
+    // Initialize temperature sensor (only for non-C5 boards)
+#ifndef ESP32C5_BOARD
     temp_sensor_config_t temp_sensor = TSENS_CONFIG_DEFAULT();
     temp_sensor.dac_offset = TSENS_DAC_L2;
     temp_sensor_set_config(temp_sensor);
     temp_sensor_start();
+#endif
 
     // Setup AP with validated values
     WiFi.mode(WIFI_AP_STA);
     WiFi.softAPConfig(AP_IP, AP_GATEWAY, AP_SUBNET);
     WiFi.softAP(ap_ssid.c_str(), ap_pass.c_str(), ap_channel, ap_hidden ? 1 : 0, max_clients);
-    
+
     Serial.printf("📡 AP: %s | IP: %s\n", ap_ssid.c_str(), AP_IP.toString().c_str());
     Serial.printf("📡 Channel: %d | Hidden: %s | Max Clients: %d\n", 
                   ap_channel, ap_hidden ? "Yes" : "No", max_clients);
@@ -650,7 +669,7 @@ void setup() {
         String json = "{\"dnsmode\":" + String(dns_mode) + "}";
         r->send(200, "application/json", json);
     });
-    
+
     server.on("/save-sta", HTTP_GET, [](AsyncWebServerRequest *r){
         if(r->hasParam("ssid")) prefs.putString("sta_ssid", r->getParam("ssid")->value());
         if(r->hasParam("pass")) prefs.putString("sta_pass", r->getParam("pass")->value());
@@ -658,36 +677,36 @@ void setup() {
         delay(1000);
         ESP.restart();
     });
-    
+
     server.on("/save-ap", HTTP_GET, [](AsyncWebServerRequest *r){
         if(r->hasParam("ssid")) prefs.putString("ap_ssid", r->getParam("ssid")->value());
-        
+
         if(r->hasParam("pass")) {
             String p = r->getParam("pass")->value();
             if (p.length() == 0 || p.length() >= 8) {
                 prefs.putString("ap_pass", p);
             }
         }
-        
+
         if(r->hasParam("channel")) {
             int ch = r->getParam("channel")->value().toInt();
             prefs.putInt("ap_channel", validateChannel(ch));
         }
-        
+
         if(r->hasParam("hidden")) {
             prefs.putBool("ap_hidden", r->getParam("hidden")->value() == "1");
         }
-        
+
         if(r->hasParam("maxclients")) {
             int clients = r->getParam("maxclients")->value().toInt();
             prefs.putInt("max_clients", validateMaxClients(clients));
         }
-        
+
         r->send(200, "text/plain", "✅ AP Config Saved. Rebooting...");
         delay(1000);
         ESP.restart();
     });
-    
+
     server.on("/save-dns", HTTP_GET, [](AsyncWebServerRequest *r){
         if(r->hasParam("dnsmode")) {
             int mode = r->getParam("dnsmode")->value().toInt();
@@ -716,7 +735,7 @@ void setup() {
         }
     });
     server.addHandler(&ws);
-    
+
     server.begin();
     setupDNS();
     Serial.printf("🌐 Web: http://%s\n", AP_IP.toString().c_str());
@@ -730,7 +749,7 @@ void setup() {
     // Watchdog
     esp_task_wdt_init(WATCHDOG_TIMEOUT, true);
     esp_task_wdt_add(NULL);
-    
+
     // Core Tasks
     xTaskCreatePinnedToCore(networkTask, "NET", 8192, NULL, 4, NULL, 0);
     xTaskCreatePinnedToCore([](void* p){ 
@@ -748,7 +767,7 @@ void setup() {
             vTaskDelay(20000); 
         } 
     }, "CHK", 2048, NULL, 1, NULL, 1);
-    
+
     // LED blink ready
     pinMode(LED_BUILTIN, OUTPUT);
     for (int i = 0; i < 3; i++) {
@@ -757,7 +776,7 @@ void setup() {
         digitalWrite(LED_BUILTIN, HIGH);
         delay(80);
     }
-    Serial.printf("✅ APEX ULTRA V19.9.7 Ready! (Full iOS/Android Support)\n");
+    Serial.printf("✅ APEX ULTRA V19.9.7 Ready on ESP32-C5! (Full iOS/Android Support)\n");
 }
 
 void loop() { 
