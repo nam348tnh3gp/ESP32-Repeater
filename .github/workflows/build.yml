@@ -12,13 +12,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Nhóm ESP32 Classic (WROOM, PICO, 32U, 32D, 32E)
           - id: "ESP32_Standard"
             target: "esp32"
-            flash: "4MB"
-          - id: "ESP32_S3_N16R8"
+          # Nhóm ESP32-S3 (N8, N16R8)
+          - id: "ESP32_S3"
             target: "esp32s3"
-            flash: "16MB"
-            psram: "opi"
+          # Nhóm ESP32-C3 (Dòng RISC-V phổ biến)
+          - id: "ESP32_C3"
+            target: "esp32c3"
 
     steps:
       - name: Checkout Code
@@ -30,39 +32,34 @@ jobs:
           esp_idf_version: v5.1
           target: ${{ matrix.target }}
           command: |
-            # 1. Dọn dẹp tuyệt đối để tránh cache lỗi
+            # 1. Dọn dẹp sạch sẽ
             rm -rf components build dependencies.lock
             mkdir -p components
             
-            # 2. Clone Arduino core (Dùng nhánh v5.1 để tương thích hoàn hảo)
+            # 2. Tải Arduino Core bản rút gọn (Không dùng recursive để tránh treo)
             git clone --branch esp-idf-v5.1-libs --depth 1 https://github.com/espressif/arduino-esp32.git components/arduino-esp32
             
-            # 3. Cập nhật submodules (Rất quan trọng để tránh thiếu header)
-            cd components/arduino-esp32 && git submodule update --init --recursive --depth 1 && cd ../..
-            
-            # 4. Tải các thư viện WebServer và JSON
+            # 3. Tải các thư viện phụ trợ
             git clone --depth 1 https://github.com/me-no-dev/AsyncTCP.git components/AsyncTCP
             git clone --depth 1 https://github.com/me-no-dev/ESPAsyncWebServer.git components/ESPAsyncWebServer
             git clone --depth 1 https://github.com/bblanchon/ArduinoJson.git components/ArduinoJson
 
-            # 5. Debug: Kiểm tra xem các file CMake có ở đúng chỗ không
-            ls -l CMakeLists.txt main/CMakeLists.txt
-            ls -d components/*/
-
-            # 6. Cấu hình SDK
+            # 4. Tạo cấu hình tối ưu cho NAT Router
             echo "CONFIG_AUTOSTART_ARDUINO=y" > sdkconfig.defaults
             echo "CONFIG_LWIP_IPV4_NAPT=y" >> sdkconfig.defaults
+            echo "CONFIG_LWIP_IP_FORWARD=y" >> sdkconfig.defaults
             
-            if [ "${{ matrix.flash }}" = "16MB" ]; then
+            # Tự động điều chỉnh Flash/PSRAM cho S3 nếu cần
+            if [ "${{ matrix.target }}" = "esp32s3" ]; then
               echo "CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y" >> sdkconfig.defaults
               echo "CONFIG_SPIRAM=y" >> sdkconfig.defaults
               echo "CONFIG_SPIRAM_MODE_OCT=y" >> sdkconfig.defaults
             fi
 
-            # 7. Biên dịch
+            # 5. Lệnh build chính
             idf.py build
             
-            # 8. Đổi tên file đầu ra
+            # 6. Gom file bin
             if [ -f build/APEX_ULTRA.bin ]; then
               mv build/APEX_ULTRA.bin build/APEX_${{ matrix.id }}.bin
             fi
