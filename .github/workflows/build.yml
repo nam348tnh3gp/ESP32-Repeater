@@ -13,40 +13,51 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Install Arduino CLI
+      - name: Install & Setup Arduino CLI
         run: |
+          # 1. Cài đặt vào thư mục nội bộ
           curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | sh
-          echo "/home/runner/bin" >> $GITHUB_PATH
+          
+          # 2. Đưa đường dẫn vào $GITHUB_PATH để các bước sau nhận diện được lệnh
+          echo "${{ github.workspace }}/bin" >> $GITHUB_PATH
+          
+          # 3. Kiểm tra cài đặt ngay lập tức
+          export PATH=$PATH:${{ github.workspace }}/bin
+          arduino-cli version
 
-      - name: Configure Arduino CLI & ESP32 Platform
+      - name: Configure ESP32-C5 Platform
         run: |
           arduino-cli config init
-          # Thêm URL platform hỗ trợ ESP32-C5
+          # Sử dụng URL hỗ trợ dòng C5 (Pioarduino)
           arduino-cli config add board_manager.additional_urls https://github.com/pioarduino/arduino-esp32/releases/download/55.3.37/package_pioarduino_index.json
           arduino-cli core update-index
           arduino-cli core install esp32:esp32
 
-      - name: Install Required Libraries
+      - name: Install Async Libraries (Fix for RISC-V/C5)
         run: |
-          # Cài đặt các thư viện từ Library Manager
           arduino-cli lib install "ArduinoJson"
-          # Các thư viện Async thường phải cài từ Git vì không có trên Manager chính thức
-          mkdir -p /home/runner/Arduino/libraries
-          cd /home/runner/Arduino/libraries
+          
+          # Cài đặt thủ công các thư viện Async để đảm bảo tương thích ESP32 Core v3 (C5)
+          mkdir -p $HOME/Arduino/libraries
+          cd $HOME/Arduino/libraries
           git clone https://github.com/mathieucarbou/AsyncTCP.git
           git clone https://github.com/mathieucarbou/ESPAsyncWebServer.git
 
-      - name: Compile Firmware for ESP32-C5
+      - name: Compile NAT Router for ESP32-C5
         run: |
-          # -b: Chỉ định board (esp32-c5-m4-evk hoặc esp32c5)
-          # --build-property: Bật tính năng NAT trên nhân LWIP
+          # Tạo thư mục tạm để chứa code đúng chuẩn Arduino (Thư mục trùng tên file .ino)
+          mkdir -p build_output
+          mkdir -p project_folder
+          cp main.cpp project_folder/project_folder.ino
+          
+          # Thực hiện biên dịch với Flag NAT và Target C5
           arduino-cli compile -b esp32:esp32:esp32c5 \
             --build-property "build.extra_flags=-DCONFIG_LWIP_IPV4_NAPT=1 -DCONFIG_IDF_TARGET_ESP32C5=1" \
             --output-dir ./build_output \
-            ./main.cpp
+            ./project_folder/project_folder.ino
 
       - name: Upload Binary Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ESP32-C5-ArduinoCLI-Bin
+          name: ESP32-C5-V19-Firmware
           path: ./build_output/*.bin
