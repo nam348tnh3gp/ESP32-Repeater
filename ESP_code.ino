@@ -1,11 +1,8 @@
 /*
-   ESP32 NAT ROUTER - V19.9.7 (ESP32-C5 SUPPORT)
-   - Full iOS & Android compatibility
-   - Captive Portal with iOS detection
-   - WebSocket auto-reconnect & heartbeat
-   - Mobile-optimized UI (font-size: 16px for inputs)
-   - Cross-platform form validation
-   - MODIFIED FOR ESP32-C5 (RISC-V)
+   ESP32 NAT ROUTER - V19.9.9 (Auto-detect 5GHz Support)
+   - Auto-detect if board supports 5GHz AP mode
+   - Disable 5GHz option on unsupported boards
+   - Show board model info on web interface
 */
 
 #include <WiFi.h>
@@ -17,19 +14,32 @@
 #include <esp_task_wdt.h>
 #include <esp_wifi.h>
 #include <esp_netif.h>
+#include <esp_chip_info.h>
 #include <atomic>
 #include <lwip/napt.h>
 #include <lwip/netif.h>
 #include <lwip/priv/tcpip_priv.h>
 #include <lwip/etharp.h>
 
-// ================= ESP32-C5 COMPATIBILITY DEFINES =================
-// ESP32-C5 không có cảm biến nhiệt độ tích hợp
-#if CONFIG_IDF_TARGET_ESP32C5
-#define ESP32C5_BOARD 1
-#endif
+// ================= BOARD DETECTION =================
+// List of ESP32 chips that support 5GHz AP mode
+// Currently only ESP32-C5 supports 5GHz
+#define CHIP_SUPPORTS_5GHZ(chip_model) (chip_model == CHIP_ESP32C5)
 
-// LED_BUILTIN cho ESP32-C5 (thường là GPIO 2 trên DevKit)
+// 5GHz channel ranges (only defined for supported chips)
+#define CHANNEL_2G_MIN 1
+#define CHANNEL_2G_MAX 13
+#define CHANNEL_5G_MIN 36
+#define CHANNEL_5G_MAX 165
+#define CHANNEL_5G_36 36
+#define CHANNEL_5G_40 40
+#define CHANNEL_5G_44 44
+#define CHANNEL_5G_48 48
+#define CHANNEL_5G_149 149
+#define CHANNEL_5G_153 153
+#define CHANNEL_5G_157 157
+#define CHANNEL_5G_161 161
+
 #ifndef LED_BUILTIN
 #define LED_BUILTIN 2
 #endif
@@ -48,8 +58,7 @@
 // AP Config Defaults
 #define DEFAULT_AP_CHANNEL 1
 #define DEFAULT_AP_HIDDEN 0
-#define MIN_CHANNEL 1
-#define MAX_CHANNEL 13
+#define DEFAULT_BAND_5GHZ 0
 #define MIN_CLIENTS 1
 #define MAX_CLIENTS_LIMIT 10
 
@@ -79,6 +88,11 @@ int ap_channel = DEFAULT_AP_CHANNEL;
 bool ap_hidden = DEFAULT_AP_HIDDEN;
 int max_clients = DEFAULT_MAX_CLIENTS;
 int dns_mode = DEFAULT_DNS_MODE;
+bool use_5ghz = DEFAULT_BAND_5GHZ;
+
+// Board info
+bool board_supports_5ghz = false;
+String board_model = "Unknown";
 
 // ================= UTILS =================
 
@@ -90,16 +104,97 @@ String urlDecode(String str) {
             sscanf(str.substring(i + 1, i + 3).c_str(), "%x", &j);
             ch = (char)j; decoded += ch; i += 2;
         } else if (str[i] == '+') decoded += ' ';
-        else decoded += str[i];
+        else decoded += ch;
     }
     return decoded;
 }
 
+// ================= BOARD DETECTION FUNCTION =================
+void detectBoardCapabilities() {
+    esp_chip_info_t chip_info;
+    esp_chip_info(&chip_info);
+    
+    // Determine chip model
+    switch(chip_info.model) {
+        case CHIP_ESP32:
+            board_model = "ESP32";
+            board_supports_5ghz = false;
+            break;
+        case CHIP_ESP32S2:
+            board_model = "ESP32-S2";
+            board_supports_5ghz = false;
+            break;
+        case CHIP_ESP32S3:
+            board_model = "ESP32-S3";
+            board_supports_5ghz = false;
+            break;
+        case CHIP_ESP32C3:
+            board_model = "ESP32-C3";
+            board_supports_5ghz = false;
+            break;
+        case CHIP_ESP32C5:
+            board_model = "ESP32-C5";
+            board_supports_5ghz = true;
+            break;
+        case CHIP_ESP32C6:
+            board_model = "ESP32-C6";
+            board_supports_5ghz = false;  // C6 supports 2.4GHz only
+            break;
+        case CHIP_ESP32H2:
+            board_model = "ESP32-H2";
+            board_supports_5ghz = false;  // H2 is 2.4GHz only
+            break;
+        case CHIP_ESP32P4:
+            board_model = "ESP32-P4";
+            board_supports_5ghz = false;  // P4 doesn't have WiFi
+            break;
+        default:
+            board_model = "ESP32 (Unknown)";
+            board_supports_5ghz = false;
+            break;
+    }
+    
+    // Override if we detect 5GHz capability via WiFi band check
+    wifi_band_t supported_bands;
+    if (esp_wifi_get_band(&supported_bands) == ESP_OK) {
+        if (supported_bands & WIFI_BAND_5GHZ) {
+            board_supports_5ghz = true;
+        }
+    }
+    
+    Serial.printf("🔍 Board Detected: %s\n", board_model.c_str());
+    Serial.printf("📡 5GHz Support: %s\n", board_supports_5ghz ? "YES" : "NO");
+    
+    // Force disable 5GHz if board doesn't support it
+    if (!board_supports_5ghz && use_5ghz) {
+        use_5ghz = false;
+        Serial.println("⚠️ Board does not support 5GHz - Forcing 2.4GHz mode");
+    }
+}
+
 // ================= VALIDATION FUNCTIONS =================
-int validateChannel(int ch) {
-    if (ch >= MIN_CHANNEL && ch <= MAX_CHANNEL) return ch;
-    Serial.printf("⚠️ Invalid channel %d, using default %d\n", ch, DEFAULT_AP_CHANNEL);
-    return DEFAULT_AP_CHANNEL;
+bool isValidChannel(int ch, bool is5GHz) {
+    if (!board_supports_5ghz && is5GHz) {
+        return false;
+    }
+    
+    if (is5GHz) {
+        return (ch >= CHANNEL_5G_MIN && ch <= CHANNEL_5G_MAX);
+    } else {
+        return (ch >= CHANNEL_2G_MIN && ch <= CHANNEL_2G_MAX);
+    }
+}
+
+int validateChannel(int ch, bool is5GHz) {
+    if (!board_supports_5ghz && is5GHz) {
+        Serial.println("⚠️ 5GHz not supported on this board, using 2.4GHz channel");
+        return DEFAULT_AP_CHANNEL;
+    }
+    
+    if (isValidChannel(ch, is5GHz)) return ch;
+    Serial.printf("⚠️ Invalid channel %d for %s, using default\n", 
+                  ch, is5GHz ? "5GHz" : "2.4GHz");
+    return is5GHz ? CHANNEL_5G_36 : DEFAULT_AP_CHANNEL;
 }
 
 int validateMaxClients(int clients) {
@@ -120,11 +215,9 @@ String validateAPPassword(String pwd) {
     return pwd;
 }
 
-// ================= TEMPERATURE (ESP32-C5 compatible) =================
-// ESP32-C5 không có cảm biến nhiệt độ tích hợp, luôn trả về 0
+// ================= TEMPERATURE =================
 float getTemperature() {
-#ifdef ESP32C5_BOARD
-    // ESP32-C5: không có cảm biến nhiệt độ
+#ifdef CONFIG_IDF_TARGET_ESP32C5
     return 0.0f;
 #else
     float temp;
@@ -135,11 +228,37 @@ float getTemperature() {
 #endif
 }
 
-// ================= RECONFIGURE AP =================
+// ================= RECONFIGURE AP WITH BAND SUPPORT =================
 void reconfigureAP() {
-    WiFi.softAP(ap_ssid.c_str(), ap_pass.c_str(), ap_channel, ap_hidden ? 1 : 0, max_clients);
-    Serial.printf("📡 AP Reconfigured: %s | Ch:%d | Hidden:%s | Max:%d\n",
-                  ap_ssid.c_str(), ap_channel, ap_hidden ? "Yes" : "No", max_clients);
+    if (board_supports_5ghz) {
+        wifi_config_t ap_config = {};
+        strcpy((char*)ap_config.ap.ssid, ap_ssid.c_str());
+        strcpy((char*)ap_config.ap.password, ap_pass.c_str());
+        ap_config.ap.ssid_len = ap_ssid.length();
+        ap_config.ap.channel = ap_channel;
+        ap_config.ap.authmode = ap_pass.length() ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
+        ap_config.ap.ssid_hidden = ap_hidden ? 1 : 0;
+        ap_config.ap.max_connection = max_clients;
+        
+        if (use_5ghz && board_supports_5ghz) {
+            ap_config.ap.phy_11b = 0;
+            ap_config.ap.phy_11g = 0;
+            ap_config.ap.phy_11n = 1;
+            ap_config.ap.phy_11ax = 1;
+            esp_wifi_set_band(WIFI_BAND_5GHZ);
+        } else {
+            esp_wifi_set_band(WIFI_BAND_2GHZ);
+        }
+        
+        esp_wifi_set_config(WIFI_IF_AP, &ap_config);
+        esp_wifi_start();
+    } else {
+        WiFi.softAP(ap_ssid.c_str(), ap_pass.c_str(), ap_channel, ap_hidden ? 1 : 0, max_clients);
+    }
+    
+    Serial.printf("📡 AP Reconfigured: %s | %s | Ch:%d | Hidden:%s | Max:%d\n",
+                  ap_ssid.c_str(), (use_5ghz && board_supports_5ghz) ? "5GHz" : "2.4GHz", 
+                  ap_channel, ap_hidden ? "Yes" : "No", max_clients);
 }
 
 // ================= DNS CONFIGURATION =================
@@ -220,10 +339,10 @@ String getIPFromMAC(uint8_t* mac) {
     return "Pending...";
 }
 
-// ================= UI (Full Mobile Support) =================
+// ================= HTML UI (Dynamic 5GHz option) =================
 const char index_html[] PROGMEM = R"rawliteral(
 <!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1, user-scalable=yes'>
-<title>APEX ULTRA V19.9.7</title>
+<title>APEX ULTRA V19.9.9</title>
 <style>
 *{box-sizing:border-box;}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;background:#020617;color:#f8fafc;padding:15px;margin:0;}
@@ -236,6 +355,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Ar
 .sig-bar{display:inline-block;width:3px;margin-left:1px;background:#475569;}
 .sig-bar.act{background:#10b981;}
 input,select{width:100%;padding:12px;margin:8px 0;border-radius:8px;border:1px solid #334155;background:#0f172a;color:white;box-sizing:border-box;font-size:16px;}
+select:disabled{opacity:0.5;cursor:not-allowed;}
 button{width:100%;padding:14px;background:#38bdf8;color:#020617;border:none;border-radius:8px;font-weight:bold;cursor:pointer;font-size:16px;transition:opacity 0.2s;}
 button:active{opacity:0.8;}
 .scanning{background:#a855f7 !important;color:white !important;}
@@ -246,9 +366,13 @@ button:active{opacity:0.8;}
 .error-message{color:#ef4444;font-size:12px;margin-top:5px;display:none;}
 .success-message{color:#10b981;font-size:12px;margin-top:5px;display:none;}
 .ios-note{background:#0f172a;padding:10px;border-radius:8px;margin-top:10px;font-size:12px;color:#94a3b8;text-align:center;}
+.info-box{background:#0f172a;padding:10px;border-radius:8px;margin-bottom:15px;font-size:13px;border-left:3px solid #38bdf8;}
+.warning-5ghz{background:#451a03;border:1px solid #f59e0b;color:#fde047;padding:10px;border-radius:8px;margin-top:10px;font-size:12px;display:none;}
+.disabled-option{background:#1a1a2e;border:1px solid #ef4444;color:#fca5a5;padding:10px;border-radius:8px;margin-top:10px;font-size:12px;display:none;}
 </style></head><body>
 <div class='card'>
-  <h3 style='margin:0;color:#38bdf8;'>🛡️ APEX ULTRA V19.9.7</h3>
+  <h3 style='margin:0;color:#38bdf8;'>🛡️ APEX ULTRA V19.9.9</h3>
+  <div class='info-box' id='boardInfo'>🔍 Detecting board...</div>
   <div class='st-grid' style='margin-top:15px;'>
     <span>📊 RAM: <b id='ram'>0</b> KB</span>
     <span>🌡️ Temp: <b id='temp'>--</b> °C</span>
@@ -280,7 +404,12 @@ button:active{opacity:0.8;}
     <input name='ssid' id='apSsid' placeholder='AP SSID' value='APEX_ULTRA' required>
     <input name='pass' type='password' id='apPass' placeholder='AP Password (min 8)'>
     <div class='config-row'>
-      <input name='channel' id='apChannel' placeholder='Channel (1-13)' value='1'>
+      <select name='band' id='apBand' onchange='updateChannelSuggestions()'>
+        <option value='0'>2.4 GHz (2G: ch 1-13)</option>
+      </select>
+    </div>
+    <div class='config-row'>
+      <input name='channel' id='apChannel' placeholder='Channel' value='1'>
       <select name='hidden' id='apHidden'>
         <option value='0'>Visible SSID</option>
         <option value='1'>Hidden SSID</option>
@@ -289,9 +418,16 @@ button:active{opacity:0.8;}
     </div>
     <div id='apError' class='error-message'></div>
     <div id='apSuccess' class='success-message'></div>
+    <div id='warning5G' class='warning-5ghz'>
+      ⚠️ Lưu ý: Chế độ 5GHz chỉ hoạt động trên ESP32-C5. Thiết bị cũ (2.4GHz only) sẽ không thấy WiFi này.
+    </div>
+    <div id='disabled5G' class='disabled-option'>
+      ❌ Board hiện tại (<span id='currentBoard'></span>) KHÔNG hỗ trợ 5GHz AP mode.<br>
+      Chỉ ESP32-C5 mới có khả năng phát WiFi 5GHz.
+    </div>
     <button type='submit' style='background:#a855f7;'>💾 Save AP Config & Reboot</button>
   </form>
-  <small>⚠️ Channel: 1-13 | Max Clients: 1-10 | Password: min 8 chars</small>
+  <small>⚠️ 5GHz: Tốc độ cao hơn, phạm vi ngắn hơn | 2.4GHz: Phạm vi xa hơn, tương thích tốt hơn</small>
 </div>
 
 <div class='card'>
@@ -310,35 +446,45 @@ button:active{opacity:0.8;}
 <div class='card'><h3>👥 Connected Clients</h3><div id='ctable' style='font-size:12px;'>-</div></div>
 
 <script>
-// iOS detection
 let isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) && !window.MSStream;
-if (isIOS) {
-    document.getElementById('iosNote').style.display = 'block';
-}
+if (isIOS) document.getElementById('iosNote').style.display = 'block';
 
-// WebSocket with auto-reconnect
 let ws = null;
 let wsRetryCount = 0;
 const MAX_RETRY = 10;
 let wsHeartbeat = null;
+let boardSupports5G = false;
+
+function updateChannelSuggestions() {
+    let band = document.getElementById('apBand').value;
+    let chInput = document.getElementById('apChannel');
+    let warningDiv = document.getElementById('warning5G');
+    
+    if (band === '1' && boardSupports5G) {
+        warningDiv.style.display = 'block';
+        if (chInput.value === '1' || chInput.value === '6' || chInput.value === '11') {
+            chInput.value = '36';
+        }
+        chInput.placeholder = '5GHz: 36,40,44,48,149,153,157,161 (36-165)';
+    } else {
+        warningDiv.style.display = 'none';
+        if (chInput.value === '36') chInput.value = '1';
+        chInput.placeholder = '2.4GHz: 1-13';
+    }
+}
 
 function connectWebSocket() {
     if (ws && ws.readyState === WebSocket.OPEN) return;
-
     try {
         ws = new WebSocket('ws://' + window.location.hostname + '/ws');
-
         ws.onopen = function() {
             console.log('✅ WebSocket connected');
             wsRetryCount = 0;
             if (wsHeartbeat) clearInterval(wsHeartbeat);
             wsHeartbeat = setInterval(function() {
-                if (ws && ws.readyState === WebSocket.OPEN) {
-                    ws.send('ping');
-                }
+                if (ws && ws.readyState === WebSocket.OPEN) ws.send('ping');
             }, 15000);
         };
-
         ws.onclose = function() {
             console.log('⚠️ WebSocket disconnected');
             if (wsHeartbeat) clearInterval(wsHeartbeat);
@@ -347,11 +493,7 @@ function connectWebSocket() {
                 setTimeout(connectWebSocket, 2000 * wsRetryCount);
             }
         };
-
-        ws.onerror = function(e) {
-            console.log('❌ WebSocket error:', e);
-        };
-
+        ws.onerror = function(e) { console.log('❌ WebSocket error:', e); };
         ws.onmessage = function(e) {
             let d = JSON.parse(e.data);
             document.getElementById('ram').innerText = Math.round(d.ram/1024);
@@ -364,10 +506,8 @@ function connectWebSocket() {
             document.getElementById('rs').innerText = d.rssi;
             document.getElementById('clientCount').innerText = d.clientCount;
             document.getElementById('clientLimit').innerText = d.clientLimit;
-
             let b = ''; for(let i=1;i<=4;i++) b += `<div class='sig-bar ${i<=d.bars?"act":""}' style='height:${i*3}px'></div>`;
             document.getElementById('bars').innerHTML = b;
-
             let h = ''; d.clients.forEach(c => { 
                 let pendingClass = c.ip === 'Pending...' ? 'pending' : '';
                 h += `<div>• <b class='${pendingClass}'>${c.ip}</b> <small style='color:#64748b'>[${c.mac}]</small></div>`; 
@@ -380,8 +520,47 @@ function connectWebSocket() {
     }
 }
 
-// Start WebSocket on page load
-document.addEventListener('DOMContentLoaded', connectWebSocket);
+document.addEventListener('DOMContentLoaded', function() {
+    connectWebSocket();
+    
+    // Get board info and config
+    fetch('/get-board-info').then(r=>r.json()).then(info=>{
+        boardSupports5G = info.supports_5ghz;
+        let boardHtml = `🔧 Board: <strong>${info.model}</strong> | 5GHz: ${info.supports_5ghz ? '✅ Supported' : '❌ Not supported'}`;
+        document.getElementById('boardInfo').innerHTML = boardHtml;
+        
+        let bandSelect = document.getElementById('apBand');
+        let disabledDiv = document.getElementById('disabled5G');
+        let currentBoardSpan = document.getElementById('currentBoard');
+        
+        if (!boardSupports5G) {
+            // Remove 5GHz option and disable it
+            while(bandSelect.options.length > 1) bandSelect.remove(1);
+            disabledDiv.style.display = 'block';
+            currentBoardSpan.innerText = info.model;
+            bandSelect.disabled = true;
+        } else {
+            // Add 5GHz option
+            let option = document.createElement('option');
+            option.value = '1';
+            option.text = '5 GHz (5G: ch 36-165) - WiFi 6';
+            bandSelect.appendChild(option);
+        }
+        
+        // Load saved config
+        fetch('/get-ap-config').then(r=>r.json()).then(d=>{
+            if (boardSupports5G && d.band_5ghz) {
+                bandSelect.value = '1';
+            } else {
+                bandSelect.value = '0';
+            }
+            document.getElementById('apChannel').value = d.channel;
+            document.getElementById('apHidden').value = d.hidden ? '1' : '0';
+            document.getElementById('apMaxClients').value = d.max_clients;
+            updateChannelSuggestions();
+        }).catch(()=>{});
+    }).catch(()=>{});
+});
 
 function validateSTAForm() {
     let ssid = document.getElementById('ssidInp').value.trim();
@@ -401,6 +580,7 @@ function validateAPForm() {
     let password = document.getElementById('apPass').value;
     let channel = parseInt(document.getElementById('apChannel').value);
     let maxClients = parseInt(document.getElementById('apMaxClients').value);
+    let band = document.getElementById('apBand').value;
 
     errorDiv.style.display = 'none';
     successDiv.style.display = 'none';
@@ -411,10 +591,19 @@ function validateAPForm() {
         return false;
     }
 
-    if(isNaN(channel) || channel < 1 || channel > 13) {
-        errorDiv.innerText = '❌ Channel must be between 1 and 13';
-        errorDiv.style.display = 'block';
-        return false;
+    // Validate channel based on band (only if 5GHz is actually supported)
+    if (band === '1' && boardSupports5G) {
+        if(isNaN(channel) || channel < 36 || channel > 165) {
+            errorDiv.innerText = '❌ 5GHz channel must be between 36 and 165 (recommended: 36,40,44,48,149,153,157,161)';
+            errorDiv.style.display = 'block';
+            return false;
+        }
+    } else {
+        if(isNaN(channel) || channel < 1 || channel > 13) {
+            errorDiv.innerText = '❌ 2.4GHz channel must be between 1 and 13';
+            errorDiv.style.display = 'block';
+            return false;
+        }
     }
 
     if(isNaN(maxClients) || maxClients < 1 || maxClients > 10) {
@@ -428,7 +617,6 @@ function validateAPForm() {
     return true;
 }
 
-// Scan button with XMLHttpRequest fallback for iOS
 document.getElementById('scanBtn').onclick = async () => {
     let btn = document.getElementById('scanBtn');
     if(btn.innerText.includes('Scanning')) return;
@@ -442,7 +630,6 @@ document.getElementById('scanBtn').onclick = async () => {
         let s = prompt("Select WiFi (enter number):\n" + listStr);
         if(s !== null && nets[s]) document.getElementById('ssidInp').value = nets[s].ssid;
     } catch(e) {
-        // Fallback for iOS
         let xhr = new XMLHttpRequest();
         xhr.open('GET', '/scan', true);
         xhr.onload = function() {
@@ -458,10 +645,8 @@ document.getElementById('scanBtn').onclick = async () => {
     btn.classList.remove('scanning');
 };
 
-// Load saved DNS mode
 fetch('/get-dns').then(r=>r.json()).then(d=>{
-    if(d.dnsmode === 1) document.getElementById('dnsModeSelect').value = '1';
-    else document.getElementById('dnsModeSelect').value = '0';
+    document.getElementById('dnsModeSelect').value = d.dnsmode;
 }).catch(()=>{});
 </script></body></html>
 )rawliteral";
@@ -522,7 +707,6 @@ void networkTask(void * pv) {
         esp_task_wdt_reset();
         uint32_t currHeap = heap_caps_get_free_size(MALLOC_CAP_8BIT);
 
-        // Memory Pressure Guard
         if (currHeap < MEM_CRITICAL_THRESHOLD) {
             LOCK_TCPIP_CORE();
             ip_napt_disable();
@@ -553,13 +737,11 @@ void networkTask(void * pv) {
             lastRSSI.store(-100);
         }
 
-        // Update temperature (fixed-point, atomic-safe)
         if (millis() - lastTempUpdate > TEMP_UPDATE_INTERVAL) {
             lastTemp.store((int)(getTemperature() * 10));
             lastTempUpdate = millis();
         }
 
-        // Broadcast telemetry every 2 seconds
         if (millis() - lastBroadcast > 2000) {
             JsonDocument doc;
             doc["ram"] = currHeap;
@@ -609,6 +791,10 @@ void setup() {
     Serial.begin(115200);
     delay(100);
     uptimeStart = millis();
+    
+    // Detect board capabilities FIRST
+    detectBoardCapabilities();
+    
     prefs.begin("apex-v19", false);
 
     // Load configurations with validation
@@ -616,42 +802,75 @@ void setup() {
     sta_pass = urlDecode(prefs.getString("sta_pass", ""));
     ap_ssid = prefs.getString("ap_ssid", "APEX_ULTRA");
     ap_pass = validateAPPassword(urlDecode(prefs.getString("ap_pass", "12345678")));
-    ap_channel = validateChannel(prefs.getInt("ap_channel", DEFAULT_AP_CHANNEL));
+    
+    // Only load 5GHz setting if board supports it
+    if (board_supports_5ghz) {
+        use_5ghz = prefs.getBool("use_5ghz", DEFAULT_BAND_5GHZ);
+    } else {
+        use_5ghz = false;
+    }
+    
+    ap_channel = validateChannel(prefs.getInt("ap_channel", DEFAULT_AP_CHANNEL), use_5ghz);
     ap_hidden = prefs.getBool("ap_hidden", DEFAULT_AP_HIDDEN);
     max_clients = validateMaxClients(prefs.getInt("max_clients", DEFAULT_MAX_CLIENTS));
     dns_mode = prefs.getInt("dns_mode", DEFAULT_DNS_MODE);
 
-    Serial.println("\n╔════════════════════════════════════════╗");
-    Serial.println("║   APEX ULTRA V19.9.7 - ESP32-C5     ║");
-    Serial.println("║   iOS & Android Compatible          ║");
-    Serial.println("║   WebSocket Auto-Reconnect          ║");
-    Serial.println("╚════════════════════════════════════════╝\n");
+    Serial.println("\n╔════════════════════════════════════════════╗");
+    Serial.println("║   APEX ULTRA V19.9.9 - 5GHz Auto-Detect ║");
+    Serial.println("║   iOS & Android Compatible              ║");
+    Serial.println("╚════════════════════════════════════════════╝\n");
 
-    // Initialize temperature sensor (only for non-C5 boards)
-#ifndef ESP32C5_BOARD
+#ifndef CONFIG_IDF_TARGET_ESP32C5
     temp_sensor_config_t temp_sensor = TSENS_CONFIG_DEFAULT();
     temp_sensor.dac_offset = TSENS_DAC_L2;
     temp_sensor_set_config(temp_sensor);
     temp_sensor_start();
 #endif
 
-    // Setup AP with validated values
+    // Setup WiFi mode
     WiFi.mode(WIFI_AP_STA);
     WiFi.softAPConfig(AP_IP, AP_GATEWAY, AP_SUBNET);
-    WiFi.softAP(ap_ssid.c_str(), ap_pass.c_str(), ap_channel, ap_hidden ? 1 : 0, max_clients);
+    
+    if (board_supports_5ghz) {
+        wifi_config_t ap_config = {};
+        strcpy((char*)ap_config.ap.ssid, ap_ssid.c_str());
+        strcpy((char*)ap_config.ap.password, ap_pass.c_str());
+        ap_config.ap.ssid_len = ap_ssid.length();
+        ap_config.ap.channel = ap_channel;
+        ap_config.ap.authmode = ap_pass.length() ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
+        ap_config.ap.ssid_hidden = ap_hidden ? 1 : 0;
+        ap_config.ap.max_connection = max_clients;
+        
+        if (use_5ghz) {
+            ap_config.ap.phy_11b = 0;
+            ap_config.ap.phy_11g = 0;
+            ap_config.ap.phy_11n = 1;
+            ap_config.ap.phy_11ax = 1;
+            esp_wifi_set_band(WIFI_BAND_5GHZ);
+            Serial.println("📡 5GHz Mode ENABLED - WiFi 6 on 5GHz band");
+        } else {
+            esp_wifi_set_band(WIFI_BAND_2GHZ);
+            Serial.println("📡 2.4GHz Mode - Standard WiFi");
+        }
+        
+        esp_wifi_set_config(WIFI_IF_AP, &ap_config);
+        esp_wifi_start();
+    } else {
+        WiFi.softAP(ap_ssid.c_str(), ap_pass.c_str(), ap_channel, ap_hidden ? 1 : 0, max_clients);
+    }
 
-    Serial.printf("📡 AP: %s | IP: %s\n", ap_ssid.c_str(), AP_IP.toString().c_str());
-    Serial.printf("📡 Channel: %d | Hidden: %s | Max Clients: %d\n", 
-                  ap_channel, ap_hidden ? "Yes" : "No", max_clients);
+    Serial.printf("📡 AP: %s | %s | Ch:%d | IP: %s\n", 
+                  ap_ssid.c_str(), (use_5ghz && board_supports_5ghz) ? "5GHz" : "2.4GHz",
+                  ap_channel, AP_IP.toString().c_str());
+    Serial.printf("📡 Hidden: %s | Max Clients: %d\n", 
+                  ap_hidden ? "Yes" : "No", max_clients);
 
-    // Register WiFi event handler
     ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
                                                         ESP_EVENT_ANY_ID,
                                                         &wifiEventHandler,
                                                         NULL,
                                                         NULL));
 
-    // Connect STA if configured
     if (sta_ssid.length() > 0) {
         WiFi.begin(sta_ssid.c_str(), sta_pass.c_str());
         Serial.printf("📡 Connecting to STA: %s\n", sta_ssid.c_str());
@@ -665,6 +884,21 @@ void setup() {
         r->send_P(200, "text/html", index_html); 
     });
     server.on("/scan", HTTP_GET, handleScan);
+    
+    server.on("/get-board-info", HTTP_GET, [](AsyncWebServerRequest *r){
+        String json = "{\"model\":\"" + board_model + "\",\"supports_5ghz\":" + 
+                      String(board_supports_5ghz ? "true" : "false") + "}";
+        r->send(200, "application/json", json);
+    });
+    
+    server.on("/get-ap-config", HTTP_GET, [](AsyncWebServerRequest *r){
+        String json = "{\"band_5ghz\":" + String(use_5ghz ? "true" : "false") + 
+                      ",\"channel\":" + String(ap_channel) +
+                      ",\"hidden\":" + String(ap_hidden ? "true" : "false") +
+                      ",\"max_clients\":" + String(max_clients) + "}";
+        r->send(200, "application/json", json);
+    });
+    
     server.on("/get-dns", HTTP_GET, [](AsyncWebServerRequest *r){
         String json = "{\"dnsmode\":" + String(dns_mode) + "}";
         r->send(200, "application/json", json);
@@ -688,9 +922,18 @@ void setup() {
             }
         }
 
+        // Only save band setting if board supports 5GHz
+        if(r->hasParam("band") && board_supports_5ghz) {
+            prefs.putBool("use_5ghz", r->getParam("band")->value() == "1");
+        }
+
         if(r->hasParam("channel")) {
+            bool is5GHz = false;
+            if(r->hasParam("band") && board_supports_5ghz) {
+                is5GHz = (r->getParam("band")->value() == "1");
+            }
             int ch = r->getParam("channel")->value().toInt();
-            prefs.putInt("ap_channel", validateChannel(ch));
+            prefs.putInt("ap_channel", validateChannel(ch, is5GHz));
         }
 
         if(r->hasParam("hidden")) {
@@ -721,14 +964,12 @@ void setup() {
         r->send(400, "text/plain", "❌ Invalid DNS mode");
     });
 
-    // WebSocket
     ws.onEvent([](AsyncWebSocket *s, AsyncWebSocketClient *c, AwsEventType t, void *arg, uint8_t *data, size_t len) {
         if (t == WS_EVT_CONNECT) {
             Serial.printf("🔌 WebSocket client connected: %u\n", c->id());
         } else if (t == WS_EVT_DISCONNECT) {
             Serial.printf("🔌 WebSocket client disconnected: %u\n", c->id());
         } else if (t == WS_EVT_DATA) {
-            // Handle ping/pong
             if (len == 4 && memcmp(data, "ping", 4) == 0) {
                 c->text("pong");
             }
@@ -741,16 +982,13 @@ void setup() {
     Serial.printf("🌐 Web: http://%s\n", AP_IP.toString().c_str());
     Serial.printf("🌐 DNS Mode: %s\n", dns_mode == DNS_MODE_CAPTIVE ? "Captive Portal" : "Normal DNS");
 
-    // mDNS
     if (MDNS.begin("apex")) {
         Serial.println("✅ mDNS: http://apex.local");
     }
 
-    // Watchdog
     esp_task_wdt_init(WATCHDOG_TIMEOUT, true);
     esp_task_wdt_add(NULL);
 
-    // Core Tasks
     xTaskCreatePinnedToCore(networkTask, "NET", 8192, NULL, 4, NULL, 0);
     xTaskCreatePinnedToCore([](void* p){ 
         esp_task_wdt_add(NULL);
@@ -768,7 +1006,6 @@ void setup() {
         } 
     }, "CHK", 2048, NULL, 1, NULL, 1);
 
-    // LED blink ready
     pinMode(LED_BUILTIN, OUTPUT);
     for (int i = 0; i < 3; i++) {
         digitalWrite(LED_BUILTIN, LOW);
@@ -776,7 +1013,11 @@ void setup() {
         digitalWrite(LED_BUILTIN, HIGH);
         delay(80);
     }
-    Serial.printf("✅ APEX ULTRA V19.9.7 Ready on ESP32-C5! (Full iOS/Android Support)\n");
+    Serial.printf("✅ APEX ULTRA V19.9.9 Ready on %s!\n", board_model.c_str());
+    if (use_5ghz && board_supports_5ghz) {
+        Serial.printf("   🌟 5GHz AP Mode Active - Channel %d\n", ap_channel);
+        Serial.printf("   📱 Connect with WiFi 6 compatible devices\n");
+    }
 }
 
 void loop() { 
