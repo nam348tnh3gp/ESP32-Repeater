@@ -1,55 +1,52 @@
-name: Build ESP32-C5 Firmware with PlatformIO
+name: Build ESP32-C5 Arduino CLI
 
 on:
   push:
     branches: [ main, master ]
-  pull_request:
-    branches: [ main, master ]
   workflow_dispatch:
 
 jobs:
-  build:
+  arduino-build:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout code
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Cache PlatformIO
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cache/pip
-            ~/.platformio/.cache
-          key: ${{ runner.os }}-pio
-
-      - name: Install PlatformIO Core
-        run: pip install --upgrade platformio
-
-      - name: Clean PlatformIO cache
+      - name: Install Arduino CLI
         run: |
-          rm -rf ~/.platformio/platforms
-          rm -rf ~/.platformio/.cache
+          curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | sh
+          echo "/home/runner/bin" >> $GITHUB_PATH
 
-      - name: Update PlatformIO
+      - name: Configure Arduino CLI & ESP32 Platform
         run: |
-          pio platform update
-          pio pkg update
+          arduino-cli config init
+          # Thêm URL platform hỗ trợ ESP32-C5
+          arduino-cli config add board_manager.additional_urls https://github.com/pioarduino/arduino-esp32/releases/download/55.3.37/package_pioarduino_index.json
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32
 
-      - name: Build firmware
-        run: pio run
+      - name: Install Required Libraries
+        run: |
+          # Cài đặt các thư viện từ Library Manager
+          arduino-cli lib install "ArduinoJson"
+          # Các thư viện Async thường phải cài từ Git vì không có trên Manager chính thức
+          mkdir -p /home/runner/Arduino/libraries
+          cd /home/runner/Arduino/libraries
+          git clone https://github.com/mathieucarbou/AsyncTCP.git
+          git clone https://github.com/mathieucarbou/ESPAsyncWebServer.git
 
-      - name: List build artifacts
-        run: ls -la .pio/build/esp32-c5-devkitc-1/
+      - name: Compile Firmware for ESP32-C5
+        run: |
+          # -b: Chỉ định board (esp32-c5-m4-evk hoặc esp32c5)
+          # --build-property: Bật tính năng NAT trên nhân LWIP
+          arduino-cli compile -b esp32:esp32:esp32c5 \
+            --build-property "build.extra_flags=-DCONFIG_LWIP_IPV4_NAPT=1 -DCONFIG_IDF_TARGET_ESP32C5=1" \
+            --output-dir ./build_output \
+            ./main.cpp
 
-      - name: Upload firmware binary
+      - name: Upload Binary Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: esp32-c5-firmware
-          path: .pio/build/esp32-c5-devkitc-1/firmware.bin
-          retention-days: 30
+          name: ESP32-C5-ArduinoCLI-Bin
+          path: ./build_output/*.bin
