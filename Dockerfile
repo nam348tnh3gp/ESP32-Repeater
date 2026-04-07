@@ -21,7 +21,7 @@ WORKDIR /firmware
 # Copy toàn bộ code vào thư mục có tên giống file .ino
 # Tạo thư mục ESP_Code và copy file vào đó
 RUN mkdir -p ESP_Code
-COPY ESP_Code.ino ESP_Code/ESP_Code.ino
+COPY ESP_code.ino ESP_Code/ESP_Code.ino
 
 # Chuyển vào thư mục sketch
 WORKDIR /firmware/ESP_Code
