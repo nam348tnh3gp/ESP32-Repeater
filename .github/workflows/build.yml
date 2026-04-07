@@ -1,23 +1,43 @@
-name: for esp32c5
+name: Build ESP32-C5 Firmware
 
-on: [push]
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
     
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
       
-      - name: Build with Docker
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install PlatformIO
         run: |
-          docker build -t esp32c5-builder .
-          docker create --name builder esp32c5-builder
-          docker cp builder:/firmware/build/ ./artifacts/
-          docker rm builder
+          pip install --upgrade pip
+          pip install platformio
       
-      - name: Upload artifacts
+      - name: Update PlatformIO
+        run: pio upgrade
+      
+      - name: Build firmware
+        run: pio run -e esp32-c5-devkitc-1
+      
+      - name: List build artifacts
+        run: ls -la .pio/build/esp32-c5-devkitc-1/
+      
+      - name: Upload firmware
         uses: actions/upload-artifact@v4
         with:
-          name: firmware-bin
-          path: artifacts/*.bin
+          name: esp32-c5-firmware
+          path: |
+            .pio/build/esp32-c5-devkitc-1/firmware.bin
+            .pio/build/esp32-c5-devkitc-1/bootloader.bin
+            .pio/build/esp32-c5-devkitc-1/partitions.bin
+          retention-days: 30
