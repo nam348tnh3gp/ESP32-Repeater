@@ -1,4 +1,4 @@
-name: APEX-ULTRA-Universal-Build
+name: APEX-ULTRA-Final
 
 on:
   push:
@@ -12,15 +12,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Nhóm ESP32 Classic (WROOM, PICO, 32U, 32D, 32E)
           - id: "ESP32_Standard"
             target: "esp32"
-          # Nhóm ESP32-S3 (N8, N16R8)
           - id: "ESP32_S3"
             target: "esp32s3"
-          # Nhóm ESP32-C3 (Dòng RISC-V phổ biến)
-          - id: "ESP32_C3"
-            target: "esp32c3"
 
     steps:
       - name: Checkout Code
@@ -32,37 +27,26 @@ jobs:
           esp_idf_version: v5.1
           target: ${{ matrix.target }}
           command: |
-            # 1. Dọn dẹp sạch sẽ
-            rm -rf components build dependencies.lock
+            # 1. Tạo thư mục components
+            rm -rf components build
             mkdir -p components
             
-            # 2. Tải Arduino Core bản rút gọn (Không dùng recursive để tránh treo)
+            # 2. Tải các bộ thư viện (Dùng bản ổn định nhất)
             git clone --branch esp-idf-v5.1-libs --depth 1 https://github.com/espressif/arduino-esp32.git components/arduino-esp32
-            
-            # 3. Tải các thư viện phụ trợ
             git clone --depth 1 https://github.com/me-no-dev/AsyncTCP.git components/AsyncTCP
             git clone --depth 1 https://github.com/me-no-dev/ESPAsyncWebServer.git components/ESPAsyncWebServer
             git clone --depth 1 https://github.com/bblanchon/ArduinoJson.git components/ArduinoJson
 
-            # 4. Tạo cấu hình tối ưu cho NAT Router
+            # 3. Cấu hình mặc định
             echo "CONFIG_AUTOSTART_ARDUINO=y" > sdkconfig.defaults
             echo "CONFIG_LWIP_IPV4_NAPT=y" >> sdkconfig.defaults
             echo "CONFIG_LWIP_IP_FORWARD=y" >> sdkconfig.defaults
             
-            # Tự động điều chỉnh Flash/PSRAM cho S3 nếu cần
-            if [ "${{ matrix.target }}" = "esp32s3" ]; then
-              echo "CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y" >> sdkconfig.defaults
-              echo "CONFIG_SPIRAM=y" >> sdkconfig.defaults
-              echo "CONFIG_SPIRAM_MODE_OCT=y" >> sdkconfig.defaults
-            fi
-
-            # 5. Lệnh build chính
+            # 4. Ép xung build
             idf.py build
             
-            # 6. Gom file bin
-            if [ -f build/APEX_ULTRA.bin ]; then
-              mv build/APEX_ULTRA.bin build/APEX_${{ matrix.id }}.bin
-            fi
+            # 5. Lưu kết quả
+            cp build/APEX_ULTRA.bin build/APEX_${{ matrix.id }}.bin
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
