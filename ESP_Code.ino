@@ -21,6 +21,11 @@
 #include <lwip/priv/tcpip_priv.h>
 #include <lwip/etharp.h>
 
+// ================= FIX: conditional include for temperature sensor =================
+#ifndef CONFIG_IDF_TARGET_ESP32C5
+#include <esp_temp_sensor.h>
+#endif
+
 // ================= BOARD DETECTION =================
 // List of ESP32 chips that support 5GHz AP mode
 // Currently only ESP32-C5 supports 5GHz
