@@ -12,16 +12,19 @@ RUN apt-get update && apt-get install -y \
 RUN curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | sh
 ENV PATH="/root/bin:${PATH}"
 
-# Cài đặt board ESP32 (bao gồm C5)
+# Cài đặt board ESP32
 RUN arduino-cli core update-index
 RUN arduino-cli core install esp32:esp32@3.0.7
 
-# Tạo thư mục sketch
 WORKDIR /firmware
-COPY . .
 
-# Liệt kê các board có sẵn để debug
-RUN arduino-cli board listall | grep -i esp32c5 || echo "ESP32-C5 not found in list"
+# Copy toàn bộ code vào thư mục có tên giống file .ino
+# Tạo thư mục ESP_Code và copy file vào đó
+RUN mkdir -p ESP_Code
+COPY ESP_Code.ino ESP_Code/ESP_Code.ino
 
-# Compile với FQBN đúng
+# Chuyển vào thư mục sketch
+WORKDIR /firmware/ESP_Code
+
+# Compile
 RUN arduino-cli compile --fqbn esp32:esp32:esp32c5 --export-binaries .
