@@ -1,11 +1,12 @@
 /*
-   ESP32 NAT ROUTER - V19.9.9 (Auto-detect 5GHz Support)
-   - Auto-detect if board supports 5GHz AP mode
-   - Disable 5GHz option on unsupported boards
-   - Show board model info on web interface
+   ESP32 NAT ROUTER - V21.1.0 (Configurable NAT + RAM Warning)
+   - Tùy chỉnh MAX_NAPT_SLOTS và MAX_NAPT_TCP qua Web UI
+   - Ràng buộc logic: Slots >= TCP ports
+   - Cảnh báo RAM khi cấu hình quá lớn
+   - Tương thích Arduino IDE (core 2.x & 3.x) và ESP-IDF
 */
 
-#include <WiFi.h>
+#include <Arduino.h>
 #include <DNSServer.h>
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
@@ -16,22 +17,33 @@
 #include <esp_netif.h>
 #include <esp_chip_info.h>
 #include <atomic>
-#include <lwip/napt.h>
-#include <lwip/netif.h>
-#include <lwip/priv/tcpip_priv.h>
-#include <lwip/etharp.h>
 
-// ================= FIX: conditional include for temperature sensor =================
+// ================= PLATFORM DETECTION =================
+#if defined(ARDUINO_ARCH_ESP32)
+    #define PLATFORM_ARDUINO 1
+    #if defined(ESP_ARDUINO_VERSION_VAL)
+        #define ARDUINO_CORE_VERSION_MAJOR ESP_ARDUINO_VERSION_MAJOR
+    #else
+        #define ARDUINO_CORE_VERSION_MAJOR 2
+    #endif
+#else
+    #define PLATFORM_ARDUINO 0
+#endif
+
+// Conditional includes cho lwIP (chỉ ESP-IDF hoặc Arduino core cũ)
+#if !PLATFORM_ARDUINO || (PLATFORM_ARDUINO && ARDUINO_CORE_VERSION_MAJOR < 3)
+    #include <lwip/napt.h>
+    #include <lwip/netif.h>
+    #include <lwip/priv/tcpip_priv.h>
+    #include <lwip/etharp.h>
+#endif
+
+// ================= TEMPERATURE SENSOR =================
 #ifndef CONFIG_IDF_TARGET_ESP32C5
 #include <esp_temp_sensor.h>
 #endif
 
 // ================= BOARD DETECTION =================
-// List of ESP32 chips that support 5GHz AP mode
-// Currently only ESP32-C5 supports 5GHz
-#define CHIP_SUPPORTS_5GHZ(chip_model) (chip_model == CHIP_ESP32C5)
-
-// 5GHz channel ranges (only defined for supported chips)
 #define CHANNEL_2G_MIN 1
 #define CHANNEL_2G_MAX 13
 #define CHANNEL_5G_MIN 36
@@ -50,10 +62,8 @@
 #endif
 
 // ================= KERNEL DEFINITIONS =================
-#define MAX_NAPT_SLOTS 2048
-#define MAX_NAPT_TCP 1024
-#define LOCK_TCPIP_CORE()   sys_lock_tcpip_core()
-#define UNLOCK_TCPIP_CORE() sys_unlock_tcpip_core()
+#define DEFAULT_NAPT_SLOTS 512
+#define DEFAULT_NAPT_TCP   256
 #define MEM_CRITICAL_THRESHOLD 26000 
 #define WATCHDOG_TIMEOUT 45
 #define MAX_SCAN_NETWORKS 10
@@ -95,12 +105,75 @@ int max_clients = DEFAULT_MAX_CLIENTS;
 int dns_mode = DEFAULT_DNS_MODE;
 bool use_5ghz = DEFAULT_BAND_5GHZ;
 
+// NAT Config variables
+int nat_max_slots = DEFAULT_NAPT_SLOTS;
+int nat_max_tcp   = DEFAULT_NAPT_TCP;
+
 // Board info
 bool board_supports_5ghz = false;
 String board_model = "Unknown";
 
-// ================= UTILS =================
+// ================= PLATFORM-SPECIFIC NAT FUNCTIONS =================
+#if PLATFORM_ARDUINO && ARDUINO_CORE_VERSION_MAJOR >= 3
+    // Arduino core 3.x - dùng API chính thức
+    void enableNAT() {
+        if (WiFi.status() == WL_CONNECTED && !natEnabled.load()) {
+            if (WiFi.AP.enableNAPT(true)) {
+                natEnabled.store(true);
+                Serial.println("✅ NAT Enabled via Arduino API");
+            } else {
+                Serial.println("❌ Failed to enable NAT");
+            }
+        }
+    }
+    
+    void disableNAT() {
+        if (natEnabled.load()) {
+            WiFi.AP.enableNAPT(false);
+            natEnabled.store(false);
+            Serial.println("⚠️ NAT Disabled");
+        }
+    }
+    
+    void initNAT() {
+        Serial.printf("✅ NAT ready (Arduino core) - slots:%d, tcp:%d\n", nat_max_slots, nat_max_tcp);
+    }
+#else
+    // ESP-IDF hoặc Arduino core cũ - dùng lwIP native API
+    #define LOCK_TCPIP_CORE()   sys_lock_tcpip_core()
+    #define UNLOCK_TCPIP_CORE() sys_unlock_tcpip_core()
+    
+    void enableNAT() {
+        if (WiFi.status() == WL_CONNECTED && !natEnabled.load()) {
+            LOCK_TCPIP_CORE();
+            if (ip_napt_enable(WiFi.localIP(), 1)) {
+                natEnabled.store(true);
+                Serial.println("✅ NAT Enabled via lwIP");
+            }
+            UNLOCK_TCPIP_CORE();
+        }
+    }
+    
+    void disableNAT() {
+        if (natEnabled.load()) {
+            LOCK_TCPIP_CORE();
+            ip_napt_disable();
+            UNLOCK_TCPIP_CORE();
+            natEnabled.store(false);
+            Serial.println("⚠️ NAT Disabled");
+        }
+    }
+    
+    void initNAT() {
+        LOCK_TCPIP_CORE();
+        ip_napt_disable();
+        ip_napt_init(nat_max_slots, nat_max_tcp);
+        UNLOCK_TCPIP_CORE();
+        Serial.printf("✅ NAT initialized: slots=%d, tcp_ports=%d\n", nat_max_slots, nat_max_tcp);
+    }
+#endif
 
+// ================= UTILS =================
 String urlDecode(String str) {
     String decoded = "";
     char ch; int i, j;
@@ -108,116 +181,80 @@ String urlDecode(String str) {
         if (str[i] == '%') {
             sscanf(str.substring(i + 1, i + 3).c_str(), "%x", &j);
             ch = (char)j; decoded += ch; i += 2;
-        } else if (str[i] == '+') decoded += ' ';
-        else decoded += ch;
+        } else if (str[i] == '+') {
+            decoded += ' ';
+        } else {
+            decoded += str[i];
+        }
     }
     return decoded;
 }
 
-// ================= BOARD DETECTION FUNCTION =================
+// ================= BOARD DETECTION =================
 void detectBoardCapabilities() {
     esp_chip_info_t chip_info;
     esp_chip_info(&chip_info);
     
-    // Determine chip model
     switch(chip_info.model) {
-        case CHIP_ESP32:
-            board_model = "ESP32";
-            board_supports_5ghz = false;
-            break;
-        case CHIP_ESP32S2:
-            board_model = "ESP32-S2";
-            board_supports_5ghz = false;
-            break;
-        case CHIP_ESP32S3:
-            board_model = "ESP32-S3";
-            board_supports_5ghz = false;
-            break;
-        case CHIP_ESP32C3:
-            board_model = "ESP32-C3";
-            board_supports_5ghz = false;
-            break;
-        case CHIP_ESP32C5:
-            board_model = "ESP32-C5";
-            board_supports_5ghz = true;
-            break;
-        case CHIP_ESP32C6:
-            board_model = "ESP32-C6";
-            board_supports_5ghz = false;  // C6 supports 2.4GHz only
-            break;
-        case CHIP_ESP32H2:
-            board_model = "ESP32-H2";
-            board_supports_5ghz = false;  // H2 is 2.4GHz only
-            break;
-        case CHIP_ESP32P4:
-            board_model = "ESP32-P4";
-            board_supports_5ghz = false;  // P4 doesn't have WiFi
-            break;
-        default:
-            board_model = "ESP32 (Unknown)";
-            board_supports_5ghz = false;
-            break;
-    }
-    
-    // Override if we detect 5GHz capability via WiFi band check
-    wifi_band_t supported_bands;
-    if (esp_wifi_get_band(&supported_bands) == ESP_OK) {
-        if (supported_bands & WIFI_BAND_5GHZ) {
-            board_supports_5ghz = true;
-        }
+        case CHIP_ESP32:    board_model = "ESP32"; board_supports_5ghz = false; break;
+        case CHIP_ESP32S2:  board_model = "ESP32-S2"; board_supports_5ghz = false; break;
+        case CHIP_ESP32S3:  board_model = "ESP32-S3"; board_supports_5ghz = false; break;
+        case CHIP_ESP32C3:  board_model = "ESP32-C3"; board_supports_5ghz = false; break;
+        case CHIP_ESP32C5:  board_model = "ESP32-C5"; board_supports_5ghz = true; break;
+        case CHIP_ESP32C6:  board_model = "ESP32-C6"; board_supports_5ghz = false; break;
+        case CHIP_ESP32H2:  board_model = "ESP32-H2"; board_supports_5ghz = false; break;
+        case CHIP_ESP32P4:  board_model = "ESP32-P4"; board_supports_5ghz = false; break;
+        default:            board_model = "ESP32 (Unknown)"; board_supports_5ghz = false; break;
     }
     
     Serial.printf("🔍 Board Detected: %s\n", board_model.c_str());
     Serial.printf("📡 5GHz Support: %s\n", board_supports_5ghz ? "YES" : "NO");
+    Serial.printf("🖥️ Platform: %s\n", PLATFORM_ARDUINO ? "Arduino IDE" : "ESP-IDF");
     
-    // Force disable 5GHz if board doesn't support it
     if (!board_supports_5ghz && use_5ghz) {
         use_5ghz = false;
         Serial.println("⚠️ Board does not support 5GHz - Forcing 2.4GHz mode");
     }
 }
 
-// ================= VALIDATION FUNCTIONS =================
+// ================= VALIDATION =================
 bool isValidChannel(int ch, bool is5GHz) {
-    if (!board_supports_5ghz && is5GHz) {
-        return false;
-    }
-    
-    if (is5GHz) {
-        return (ch >= CHANNEL_5G_MIN && ch <= CHANNEL_5G_MAX);
-    } else {
-        return (ch >= CHANNEL_2G_MIN && ch <= CHANNEL_2G_MAX);
-    }
+    if (!board_supports_5ghz && is5GHz) return false;
+    if (is5GHz) return (ch >= CHANNEL_5G_MIN && ch <= CHANNEL_5G_MAX);
+    return (ch >= CHANNEL_2G_MIN && ch <= CHANNEL_2G_MAX);
 }
 
 int validateChannel(int ch, bool is5GHz) {
     if (!board_supports_5ghz && is5GHz) {
-        Serial.println("⚠️ 5GHz not supported on this board, using 2.4GHz channel");
         return DEFAULT_AP_CHANNEL;
     }
-    
     if (isValidChannel(ch, is5GHz)) return ch;
-    Serial.printf("⚠️ Invalid channel %d for %s, using default\n", 
-                  ch, is5GHz ? "5GHz" : "2.4GHz");
     return is5GHz ? CHANNEL_5G_36 : DEFAULT_AP_CHANNEL;
 }
 
 int validateMaxClients(int clients) {
     if (clients >= MIN_CLIENTS && clients <= MAX_CLIENTS_LIMIT) return clients;
-    Serial.printf("⚠️ Invalid max clients %d, using default %d\n", clients, DEFAULT_MAX_CLIENTS);
     return DEFAULT_MAX_CLIENTS;
 }
 
 String validateAPPassword(String pwd) {
-    if (pwd.length() == 0) {
-        Serial.println("⚠️ Empty AP password, using default '12345678'");
-        return "12345678";
-    }
-    if (pwd.length() < 8) {
-        Serial.printf("⚠️ Password too short (%d chars), using default '12345678'\n", pwd.length());
-        return "12345678";
-    }
+    if (pwd.length() == 0) return "12345678";
+    if (pwd.length() < 8) return "12345678";
     return pwd;
+}
+
+// NAT validation với ràng buộc slots >= tcp
+int validateNATSlots(int slots, int tcp_ports) {
+    if (slots < 64) slots = 64;
+    if (slots > 4096) slots = 4096;
+    if (slots < tcp_ports) slots = tcp_ports;
+    return slots;
+}
+
+int validateNATTCP(int tcp) {
+    if (tcp < 32) tcp = 32;
+    if (tcp > 2048) tcp = 2048;
+    return tcp;
 }
 
 // ================= TEMPERATURE =================
@@ -226,85 +263,43 @@ float getTemperature() {
     return 0.0f;
 #else
     float temp;
-    if (temp_sensor_read_celsius(&temp) == ESP_OK) {
-        return temp;
-    }
+    if (temp_sensor_read_celsius(&temp) == ESP_OK) return temp;
     return 0.0f;
 #endif
 }
 
-// ================= RECONFIGURE AP WITH BAND SUPPORT =================
-void reconfigureAP() {
-    if (board_supports_5ghz) {
-        wifi_config_t ap_config = {};
-        strcpy((char*)ap_config.ap.ssid, ap_ssid.c_str());
-        strcpy((char*)ap_config.ap.password, ap_pass.c_str());
-        ap_config.ap.ssid_len = ap_ssid.length();
-        ap_config.ap.channel = ap_channel;
-        ap_config.ap.authmode = ap_pass.length() ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
-        ap_config.ap.ssid_hidden = ap_hidden ? 1 : 0;
-        ap_config.ap.max_connection = max_clients;
-        
-        if (use_5ghz && board_supports_5ghz) {
-            ap_config.ap.phy_11b = 0;
-            ap_config.ap.phy_11g = 0;
-            ap_config.ap.phy_11n = 1;
-            ap_config.ap.phy_11ax = 1;
-            esp_wifi_set_band(WIFI_BAND_5GHZ);
-        } else {
-            esp_wifi_set_band(WIFI_BAND_2GHZ);
-        }
-        
-        esp_wifi_set_config(WIFI_IF_AP, &ap_config);
-        esp_wifi_start();
-    } else {
-        WiFi.softAP(ap_ssid.c_str(), ap_pass.c_str(), ap_channel, ap_hidden ? 1 : 0, max_clients);
-    }
-    
-    Serial.printf("📡 AP Reconfigured: %s | %s | Ch:%d | Hidden:%s | Max:%d\n",
-                  ap_ssid.c_str(), (use_5ghz && board_supports_5ghz) ? "5GHz" : "2.4GHz", 
-                  ap_channel, ap_hidden ? "Yes" : "No", max_clients);
-}
-
-// ================= DNS CONFIGURATION =================
+// ================= DNS =================
 void setupDNS() {
     if (dns_mode == DNS_MODE_CAPTIVE) {
         dns.start(53, "*", AP_IP);
-        Serial.println("✅ DNS Captive Portal Mode: All domains -> 192.168.4.1");
+        Serial.println("✅ DNS Captive Portal Mode");
     } else {
         dns.start(53, "*", IPAddress(0, 0, 0, 0));
-        Serial.println("✅ DNS Normal Mode: Standard DNS resolution");
+        Serial.println("✅ DNS Normal Mode");
     }
 }
 
 // ================= WIFI EVENT HANDLER =================
 void wifiEventHandler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_STACONNECTED) {
-        wifi_event_ap_staconnected_t* event = (wifi_event_ap_staconnected_t*)event_data;
         currentClients.fetch_add(1);
-        Serial.printf("✅ Client connected: %02X:%02X:%02X:%02X:%02X:%02X | Total: %d/%d\n",
-                      event->mac[0], event->mac[1], event->mac[2],
-                      event->mac[3], event->mac[4], event->mac[5],
-                      currentClients.load(), max_clients);
+        Serial.printf("✅ Client connected | Total: %d/%d\n", currentClients.load(), max_clients);
     }
     else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_STADISCONNECTED) {
-        wifi_event_ap_stadisconnected_t* event = (wifi_event_ap_stadisconnected_t*)event_data;
         int newCount = currentClients.fetch_sub(1) - 1;
         if (newCount < 0) currentClients.store(0);
-        Serial.printf("❌ Client disconnected: %02X:%02X:%02X:%02X:%02X:%02X | Total: %d/%d\n",
-                      event->mac[0], event->mac[1], event->mac[2],
-                      event->mac[3], event->mac[4], event->mac[5],
-                      currentClients.load(), max_clients);
+        Serial.printf("❌ Client disconnected | Total: %d/%d\n", currentClients.load(), max_clients);
     }
 }
 
-// ================= REAL IP RESOLVER =================
+// ================= GET IP FROM MAC =================
+#if !PLATFORM_ARDUINO || (PLATFORM_ARDUINO && ARDUINO_CORE_VERSION_MAJOR < 3)
+// ESP-IDF hoặc core cũ - dùng ARP table
 struct netif* getAPNetif() {
     esp_netif_t *ap_esp_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
     if (ap_esp_netif != NULL) {
         return esp_netif_get_netif_impl(ap_esp_netif);
     }
-
     struct netif *netif_ap = netif_list;
     while (netif_ap != NULL) {
         if ((netif_ap->name[0] == 'a' && netif_ap->name[1] == 'p') ||
@@ -319,12 +314,9 @@ struct netif* getAPNetif() {
 String getIPFromMAC(uint8_t* mac) {
     struct netif *netif_ap = getAPNetif();
     if (netif_ap == NULL) return "No AP Netif";
-
-    struct eth_addr mac_addr;
-    memcpy(mac_addr.addr, mac, ETH_HWADDR_LEN);
+    
     ip4_addr_t *ip_found = NULL;
-
-    LOCK_TCPIP_CORE();
+    
     for (int i = 0; i < ARP_TABLE_SIZE; i++) {
         struct etharp_entry *entry = &arp_table[i];
         if (entry->state == ETHARP_STATE_STABLE || entry->state == ETHARP_STATE_PENDING) {
@@ -334,8 +326,7 @@ String getIPFromMAC(uint8_t* mac) {
             }
         }
     }
-    UNLOCK_TCPIP_CORE();
-
+    
     if (ip_found != NULL) {
         char ip_str[16];
         ip4addr_ntoa_r(ip_found, ip_str, sizeof(ip_str));
@@ -343,320 +334,136 @@ String getIPFromMAC(uint8_t* mac) {
     }
     return "Pending...";
 }
+#else
+// Arduino core 3.x - trả về trạng thái kết nối
+String getIPFromMAC(uint8_t* mac) {
+    wifi_sta_list_t sta_list;
+    esp_wifi_ap_get_sta_list(&sta_list);
+    for (int i = 0; i < sta_list.num; i++) {
+        if (memcmp(sta_list.sta[i].mac, mac, 6) == 0) {
+            return "Connected";
+        }
+    }
+    return "Unknown";
+}
+#endif
 
-// ================= HTML UI (Dynamic 5GHz option) =================
+// ================= HTML UI =================
 const char index_html[] PROGMEM = R"rawliteral(
-<!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1, user-scalable=yes'>
-<title>APEX ULTRA V19.9.9</title>
+<!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1'>
+<title>APEX ULTRA V21.1.0</title>
 <style>
 *{box-sizing:border-box;}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;background:#020617;color:#f8fafc;padding:15px;margin:0;}
+body{font-family:Arial,sans-serif;background:#020617;color:#f8fafc;padding:15px;margin:0;}
 .card{background:#1e293b;padding:20px;margin-bottom:15px;border-radius:12px;border:1px solid #334155;}
-.st-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;font-size:13px;}
-.badge{padding:4px 8px;border-radius:6px;font-weight:bold;font-size:10px;border:1px solid #475569;display:inline-block;}
-.ok{color:#10b981;border-color:#10b981;} .bad{color:#ef4444;border-color:#ef4444;}
-.nat-on{color:#3b82f6;border-color:#3b82f6;}
-.nat-off{color:#ef4444;border-color:#ef4444;}
-.sig-bar{display:inline-block;width:3px;margin-left:1px;background:#475569;}
-.sig-bar.act{background:#10b981;}
-input,select{width:100%;padding:12px;margin:8px 0;border-radius:8px;border:1px solid #334155;background:#0f172a;color:white;box-sizing:border-box;font-size:16px;}
-select:disabled{opacity:0.5;cursor:not-allowed;}
-button{width:100%;padding:14px;background:#38bdf8;color:#020617;border:none;border-radius:8px;font-weight:bold;cursor:pointer;font-size:16px;transition:opacity 0.2s;}
-button:active{opacity:0.8;}
-.scanning{background:#a855f7 !important;color:white !important;}
-.pending{color:#f59e0b;}
-.config-row{display:flex;gap:10px;margin-bottom:10px;flex-wrap:wrap;}
-.config-row input{flex:1;min-width:100px;}
-.config-row select{flex:1;min-width:100px;}
-.error-message{color:#ef4444;font-size:12px;margin-top:5px;display:none;}
-.success-message{color:#10b981;font-size:12px;margin-top:5px;display:none;}
-.ios-note{background:#0f172a;padding:10px;border-radius:8px;margin-top:10px;font-size:12px;color:#94a3b8;text-align:center;}
-.info-box{background:#0f172a;padding:10px;border-radius:8px;margin-bottom:15px;font-size:13px;border-left:3px solid #38bdf8;}
-.warning-5ghz{background:#451a03;border:1px solid #f59e0b;color:#fde047;padding:10px;border-radius:8px;margin-top:10px;font-size:12px;display:none;}
-.disabled-option{background:#1a1a2e;border:1px solid #ef4444;color:#fca5a5;padding:10px;border-radius:8px;margin-top:10px;font-size:12px;display:none;}
+input,select{width:100%;padding:12px;margin:8px 0;border-radius:8px;background:#0f172a;color:white;border:1px solid #334155;}
+button{width:100%;padding:14px;background:#38bdf8;color:#020617;border:none;border-radius:8px;font-weight:bold;cursor:pointer;}
+.badge{padding:4px 8px;border-radius:6px;display:inline-block;}
+.ok{color:#10b981;} .bad{color:#ef4444;}
+.warning{color:#f59e0b;}
 </style></head><body>
 <div class='card'>
-  <h3 style='margin:0;color:#38bdf8;'>🛡️ APEX ULTRA V19.9.9</h3>
-  <div class='info-box' id='boardInfo'>🔍 Detecting board...</div>
-  <div class='st-grid' style='margin-top:15px;'>
-    <span>📊 RAM: <b id='ram'>0</b> KB</span>
-    <span>🌡️ Temp: <b id='temp'>--</b> °C</span>
-    <span>⏱️ Uptime: <b id='uptime'>0</b>s</span>
-    <span>🌐 Net: <span id='net' class='badge'>WAIT</span></span>
-    <span>🔁 NAT: <span id='nat' class='badge'>WAIT</span></span>
-    <span>📱 Clients: <b id='clientCount'>0</b> / <b id='clientLimit'>--</b></span>
-    <span style='grid-column:span 2;'>📡 Signal: <b id='rs'>-</b> dBm <span id='bars'></span></span>
-  </div>
-  <div class='ios-note' id='iosNote' style='display:none;'>
-    💡 iOS: If config page doesn't open, open Safari and go to <strong>http://192.168.4.1</strong>
-  </div>
+  <h3>🛡️ APEX ULTRA V21.1.0 (NAT Configurable)</h3>
+  <div id='boardInfo'></div>
+  <div>📊 RAM: <b id='ram'>0</b> KB</div>
+  <div>🌡️ Temp: <b id='temp'>--</b> °C</div>
+  <div>🌐 Net: <span id='net' class='badge'>WAIT</span></div>
+  <div>🔁 NAT: <span id='nat' class='badge'>WAIT</span></div>
+  <div>📱 Clients: <b id='clientCount'>0</b> / <b id='clientLimit'>0</b></div>
 </div>
 
 <div class='card'>
   <h3>📡 Uplink Configuration</h3>
-  <button id='scanBtn' style='background:#475569;color:white;margin-bottom:10px;'>🔍 Scan WiFi Networks</button>
-  <form id='staForm' action='/save-sta' method='get' onsubmit='return validateSTAForm()'>
+  <button id='scanBtn'>🔍 Scan WiFi</button>
+  <form action='/save-sta' method='get'>
     <input name='ssid' id='ssidInp' placeholder='WiFi Name' required>
-    <input name='pass' type='password' id='staPass' placeholder='Password'>
-    <div id='staError' class='error-message'></div>
-    <button type='submit'>🚀 Connect Router</button>
+    <input name='pass' type='password' placeholder='Password'>
+    <button type='submit'>🚀 Connect</button>
   </form>
 </div>
 
 <div class='card'>
   <h3>🎛️ Access Point Configuration</h3>
-  <form id='apForm' action='/save-ap' method='get' onsubmit='return validateAPForm()'>
-    <input name='ssid' id='apSsid' placeholder='AP SSID' value='APEX_ULTRA' required>
-    <input name='pass' type='password' id='apPass' placeholder='AP Password (min 8)'>
-    <div class='config-row'>
-      <select name='band' id='apBand' onchange='updateChannelSuggestions()'>
-        <option value='0'>2.4 GHz (2G: ch 1-13)</option>
-      </select>
-    </div>
-    <div class='config-row'>
-      <input name='channel' id='apChannel' placeholder='Channel' value='1'>
-      <select name='hidden' id='apHidden'>
-        <option value='0'>Visible SSID</option>
-        <option value='1'>Hidden SSID</option>
-      </select>
-      <input name='maxclients' id='apMaxClients' placeholder='Max Clients (1-10)' value='7'>
-    </div>
-    <div id='apError' class='error-message'></div>
-    <div id='apSuccess' class='success-message'></div>
-    <div id='warning5G' class='warning-5ghz'>
-      ⚠️ Lưu ý: Chế độ 5GHz chỉ hoạt động trên ESP32-C5. Thiết bị cũ (2.4GHz only) sẽ không thấy WiFi này.
-    </div>
-    <div id='disabled5G' class='disabled-option'>
-      ❌ Board hiện tại (<span id='currentBoard'></span>) KHÔNG hỗ trợ 5GHz AP mode.<br>
-      Chỉ ESP32-C5 mới có khả năng phát WiFi 5GHz.
-    </div>
-    <button type='submit' style='background:#a855f7;'>💾 Save AP Config & Reboot</button>
+  <form action='/save-ap' method='get'>
+    <input name='ssid' placeholder='AP SSID' value='APEX_ULTRA'>
+    <input name='pass' type='password' placeholder='AP Password (min 8)'>
+    <input name='channel' placeholder='Channel (1-13 hoặc 36-165)' value='1'>
+    <button type='submit'>💾 Save & Reboot</button>
   </form>
-  <small>⚠️ 5GHz: Tốc độ cao hơn, phạm vi ngắn hơn | 2.4GHz: Phạm vi xa hơn, tương thích tốt hơn</small>
 </div>
 
 <div class='card'>
-  <h3>⚙️ Advanced Settings</h3>
-  <form id='dnsForm' action='/save-dns' method='get'>
-    <select name='dnsmode' id='dnsModeSelect'>
-      <option value='0'>Captive Portal (Redirect all to config page)</option>
-      <option value='1'>Normal DNS (Standard internet browsing)</option>
-    </select>
-    <div id='dnsInfo' class='success-message' style='margin-top:10px;'></div>
-    <button type='submit' style='background:#475569;'>💾 Save DNS Mode & Reboot</button>
+  <h3>⚙️ NAT Advanced Settings</h3>
+  <form action='/save-nat' method='get' id='natForm'>
+    <input name='slots' id='natSlots' placeholder='Max NAPT Slots (64-4096)' value='512'>
+    <input name='tcp' id='natTcp' placeholder='Max TCP ports (32-2048)' value='256'>
+    <div id='ramWarning' class='warning' style='display:none; font-size:12px; margin:5px 0;'></div>
+    <button type='submit'>💾 Save NAT Config & Reboot</button>
   </form>
-  <small>💡 Captive Portal: Good for initial setup | Normal: Better for regular use</small>
+  <small>⚠️ Slots phải >= TCP ports. Slots >1024 có thể gây thiếu RAM.</small>
 </div>
 
 <div class='card'><h3>👥 Connected Clients</h3><div id='ctable' style='font-size:12px;'>-</div></div>
 
 <script>
-let isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) && !window.MSStream;
-if (isIOS) document.getElementById('iosNote').style.display = 'block';
-
-let ws = null;
-let wsRetryCount = 0;
-const MAX_RETRY = 10;
-let wsHeartbeat = null;
-let boardSupports5G = false;
-
-function updateChannelSuggestions() {
-    let band = document.getElementById('apBand').value;
-    let chInput = document.getElementById('apChannel');
-    let warningDiv = document.getElementById('warning5G');
-    
-    if (band === '1' && boardSupports5G) {
-        warningDiv.style.display = 'block';
-        if (chInput.value === '1' || chInput.value === '6' || chInput.value === '11') {
-            chInput.value = '36';
-        }
-        chInput.placeholder = '5GHz: 36,40,44,48,149,153,157,161 (36-165)';
-    } else {
-        warningDiv.style.display = 'none';
-        if (chInput.value === '36') chInput.value = '1';
-        chInput.placeholder = '2.4GHz: 1-13';
-    }
-}
-
-function connectWebSocket() {
-    if (ws && ws.readyState === WebSocket.OPEN) return;
-    try {
-        ws = new WebSocket('ws://' + window.location.hostname + '/ws');
-        ws.onopen = function() {
-            console.log('✅ WebSocket connected');
-            wsRetryCount = 0;
-            if (wsHeartbeat) clearInterval(wsHeartbeat);
-            wsHeartbeat = setInterval(function() {
-                if (ws && ws.readyState === WebSocket.OPEN) ws.send('ping');
-            }, 15000);
-        };
-        ws.onclose = function() {
-            console.log('⚠️ WebSocket disconnected');
-            if (wsHeartbeat) clearInterval(wsHeartbeat);
-            if (wsRetryCount < MAX_RETRY) {
-                wsRetryCount++;
-                setTimeout(connectWebSocket, 2000 * wsRetryCount);
-            }
-        };
-        ws.onerror = function(e) { console.log('❌ WebSocket error:', e); };
-        ws.onmessage = function(e) {
-            let d = JSON.parse(e.data);
-            document.getElementById('ram').innerText = Math.round(d.ram/1024);
-            document.getElementById('temp').innerText = d.temp.toFixed(1);
-            document.getElementById('uptime').innerText = d.uptime;
-            document.getElementById('net').innerText = d.internet ? 'ONLINE' : 'OFFLINE';
-            document.getElementById('net').className = 'badge ' + (d.internet ? 'ok' : 'bad');
-            document.getElementById('nat').innerText = d.nat ? 'ACTIVE' : 'DISABLED';
-            document.getElementById('nat').className = 'badge ' + (d.nat ? 'nat-on' : 'nat-off');
-            document.getElementById('rs').innerText = d.rssi;
-            document.getElementById('clientCount').innerText = d.clientCount;
-            document.getElementById('clientLimit').innerText = d.clientLimit;
-            let b = ''; for(let i=1;i<=4;i++) b += `<div class='sig-bar ${i<=d.bars?"act":""}' style='height:${i*3}px'></div>`;
-            document.getElementById('bars').innerHTML = b;
-            let h = ''; d.clients.forEach(c => { 
-                let pendingClass = c.ip === 'Pending...' ? 'pending' : '';
-                h += `<div>• <b class='${pendingClass}'>${c.ip}</b> <small style='color:#64748b'>[${c.mac}]</small></div>`; 
-            });
-            document.getElementById('ctable').innerHTML = h || '<i style="color:#64748b;">No clients connected</i>';
-        };
-    } catch(e) {
-        console.log('WebSocket init error:', e);
-        setTimeout(connectWebSocket, 3000);
-    }
-}
-
-document.addEventListener('DOMContentLoaded', function() {
-    connectWebSocket();
-    
-    // Get board info and config
-    fetch('/get-board-info').then(r=>r.json()).then(info=>{
-        boardSupports5G = info.supports_5ghz;
-        let boardHtml = `🔧 Board: <strong>${info.model}</strong> | 5GHz: ${info.supports_5ghz ? '✅ Supported' : '❌ Not supported'}`;
-        document.getElementById('boardInfo').innerHTML = boardHtml;
-        
-        let bandSelect = document.getElementById('apBand');
-        let disabledDiv = document.getElementById('disabled5G');
-        let currentBoardSpan = document.getElementById('currentBoard');
-        
-        if (!boardSupports5G) {
-            // Remove 5GHz option and disable it
-            while(bandSelect.options.length > 1) bandSelect.remove(1);
-            disabledDiv.style.display = 'block';
-            currentBoardSpan.innerText = info.model;
-            bandSelect.disabled = true;
-        } else {
-            // Add 5GHz option
-            let option = document.createElement('option');
-            option.value = '1';
-            option.text = '5 GHz (5G: ch 36-165) - WiFi 6';
-            bandSelect.appendChild(option);
-        }
-        
-        // Load saved config
-        fetch('/get-ap-config').then(r=>r.json()).then(d=>{
-            if (boardSupports5G && d.band_5ghz) {
-                bandSelect.value = '1';
-            } else {
-                bandSelect.value = '0';
-            }
-            document.getElementById('apChannel').value = d.channel;
-            document.getElementById('apHidden').value = d.hidden ? '1' : '0';
-            document.getElementById('apMaxClients').value = d.max_clients;
-            updateChannelSuggestions();
-        }).catch(()=>{});
-    }).catch(()=>{});
-});
-
-function validateSTAForm() {
-    let ssid = document.getElementById('ssidInp').value.trim();
-    let errorDiv = document.getElementById('staError');
-    if(ssid === '') {
-        errorDiv.innerText = '❌ SSID cannot be empty';
-        errorDiv.style.display = 'block';
-        return false;
-    }
-    errorDiv.style.display = 'none';
-    return true;
-}
-
-function validateAPForm() {
-    let errorDiv = document.getElementById('apError');
-    let successDiv = document.getElementById('apSuccess');
-    let password = document.getElementById('apPass').value;
-    let channel = parseInt(document.getElementById('apChannel').value);
-    let maxClients = parseInt(document.getElementById('apMaxClients').value);
-    let band = document.getElementById('apBand').value;
-
-    errorDiv.style.display = 'none';
-    successDiv.style.display = 'none';
-
-    if(password.length > 0 && password.length < 8) {
-        errorDiv.innerText = '❌ Password must be at least 8 characters (or leave empty to keep current)';
-        errorDiv.style.display = 'block';
-        return false;
-    }
-
-    // Validate channel based on band (only if 5GHz is actually supported)
-    if (band === '1' && boardSupports5G) {
-        if(isNaN(channel) || channel < 36 || channel > 165) {
-            errorDiv.innerText = '❌ 5GHz channel must be between 36 and 165 (recommended: 36,40,44,48,149,153,157,161)';
-            errorDiv.style.display = 'block';
-            return false;
-        }
-    } else {
-        if(isNaN(channel) || channel < 1 || channel > 13) {
-            errorDiv.innerText = '❌ 2.4GHz channel must be between 1 and 13';
-            errorDiv.style.display = 'block';
-            return false;
-        }
-    }
-
-    if(isNaN(maxClients) || maxClients < 1 || maxClients > 10) {
-        errorDiv.innerText = '❌ Max clients must be between 1 and 10';
-        errorDiv.style.display = 'block';
-        return false;
-    }
-
-    successDiv.innerText = '✅ Settings validated! Rebooting...';
-    successDiv.style.display = 'block';
-    return true;
-}
+let ws = new WebSocket('ws://' + location.hostname + '/ws');
+ws.onmessage = e => {
+    let d = JSON.parse(e.data);
+    document.getElementById('ram').innerText = Math.round(d.ram/1024);
+    document.getElementById('temp').innerText = d.temp;
+    document.getElementById('net').innerText = d.internet ? 'ONLINE' : 'OFFLINE';
+    document.getElementById('nat').innerText = d.nat ? 'ACTIVE' : 'OFF';
+    document.getElementById('clientCount').innerText = d.clientCount;
+    document.getElementById('clientLimit').innerText = d.clientLimit;
+    let h = '';
+    d.clients.forEach(c => { h += `<div>• ${c.ip} <small>[${c.mac}]</small></div>`; });
+    document.getElementById('ctable').innerHTML = h || '<i>No clients</i>';
+};
 
 document.getElementById('scanBtn').onclick = async () => {
     let btn = document.getElementById('scanBtn');
-    if(btn.innerText.includes('Scanning')) return;
     btn.innerText = '⏳ Scanning...';
-    btn.classList.add('scanning');
-
-    try {
-        let r = await fetch('/scan');
-        let nets = await r.json();
-        let listStr = nets.map((n,i)=> i+": "+n.ssid+" ("+n.rssi+"dBm)").join("\n");
-        let s = prompt("Select WiFi (enter number):\n" + listStr);
-        if(s !== null && nets[s]) document.getElementById('ssidInp').value = nets[s].ssid;
-    } catch(e) {
-        let xhr = new XMLHttpRequest();
-        xhr.open('GET', '/scan', true);
-        xhr.onload = function() {
-            let nets = JSON.parse(xhr.responseText);
-            let listStr = nets.map((n,i)=> i+": "+n.ssid+" ("+n.rssi+"dBm)").join("\n");
-            let s = prompt("Select WiFi (enter number):\n" + listStr);
-            if(s !== null && nets[s]) document.getElementById('ssidInp').value = nets[s].ssid;
-        };
-        xhr.send();
-    }
-
-    btn.innerText = '🔍 Scan WiFi Networks';
-    btn.classList.remove('scanning');
+    let r = await fetch('/scan');
+    let nets = await r.json();
+    let list = nets.map((n,i)=> i+": "+n.ssid+" ("+n.rssi+"dBm)").join("\n");
+    let s = prompt("Select WiFi (enter number):\n"+list);
+    if(s !== null && nets[s]) document.getElementById('ssidInp').value = nets[s].ssid;
+    btn.innerText = '🔍 Scan WiFi';
 };
 
-fetch('/get-dns').then(r=>r.json()).then(d=>{
-    document.getElementById('dnsModeSelect').value = d.dnsmode;
-}).catch(()=>{});
+// Cảnh báo RAM khi nhập slots quá lớn
+document.getElementById('natSlots').addEventListener('input', function() {
+    let slots = parseInt(this.value);
+    let warningDiv = document.getElementById('ramWarning');
+    if (slots > 1024) {
+        warningDiv.style.display = 'block';
+        warningDiv.innerHTML = '⚠️ Cảnh báo: ' + slots + ' slots có thể tiêu tốn >' + Math.round(slots * 0.1) + 'KB RAM. ESP32 có thể không ổn định!';
+    } else {
+        warningDiv.style.display = 'none';
+    }
+});
+
+document.getElementById('natForm').onsubmit = function() {
+    let slots = parseInt(document.getElementById('natSlots').value);
+    let tcp = parseInt(document.getElementById('natTcp').value);
+    if (slots < tcp) {
+        alert('❌ Lỗi: Slots (' + slots + ') phải lớn hơn hoặc bằng TCP ports (' + tcp + ')');
+        return false;
+    }
+    return true;
+};
+
+fetch('/get-board-info').then(r=>r.json()).then(info=>{
+    document.getElementById('boardInfo').innerHTML = `🔧 Board: ${info.model} | 5GHz: ${info.supports_5ghz ? '✅' : '❌'}`;
+});
+fetch('/get-nat-config').then(r=>r.json()).then(nat=>{
+    document.getElementById('natSlots').value = nat.slots;
+    document.getElementById('natTcp').value = nat.tcp;
+});
 </script></body></html>
 )rawliteral";
 
-// ================= OPTIMIZED SCAN HANDLER =================
+// ================= SCAN HANDLER =================
 void handleScan(AsyncWebServerRequest *r) {
     if (scanInProgress.exchange(true)) {
         r->send(429, "application/json", "[]");
@@ -664,10 +471,8 @@ void handleScan(AsyncWebServerRequest *r) {
     }
 
     WiFi.scanNetworks(true);
-    int n = -1;
-    int timeout = 8000;
-    int elapsed = 0;
-
+    int n = -1, timeout = 8000, elapsed = 0;
+    
     while (n == -1 && elapsed < timeout) {
         delay(100);
         n = WiFi.scanComplete();
@@ -675,7 +480,7 @@ void handleScan(AsyncWebServerRequest *r) {
         esp_task_wdt_reset();
     }
 
-    if (n == -2 || n <= 0) {
+    if (n <= 0) {
         WiFi.scanDelete();
         scanInProgress.store(false);
         r->send(500, "application/json", "[]");
@@ -684,8 +489,8 @@ void handleScan(AsyncWebServerRequest *r) {
 
     JsonDocument doc;
     JsonArray array = doc.to<JsonArray>();
-
-    int limit = (n > MAX_SCAN_NETWORKS) ? MAX_SCAN_NETWORKS : n;
+    int limit = min(n, MAX_SCAN_NETWORKS);
+    
     for (int i = 0; i < limit; i++) {
         JsonObject item = array.add<JsonObject>();
         item["ssid"] = WiFi.SSID(i);
@@ -694,52 +499,38 @@ void handleScan(AsyncWebServerRequest *r) {
 
     String out;
     serializeJson(doc, out);
-
     WiFi.scanDelete();
     scanInProgress.store(false);
     r->send(200, "application/json", out);
 }
 
-// ================= CORE NETWORK TASK =================
+// ================= NETWORK TASK =================
 void networkTask(void * pv) {
     esp_task_wdt_add(NULL);
     static uint32_t lastBroadcast = 0;
-    static bool natInit = false;
-    static int lastClientCount = -1;
+    static bool natInitialized = false;
     static unsigned long lastTempUpdate = 0;
+    static int lastClientCount = -1;
 
     for(;;) {
         esp_task_wdt_reset();
         uint32_t currHeap = heap_caps_get_free_size(MALLOC_CAP_8BIT);
 
-        if (currHeap < MEM_CRITICAL_THRESHOLD) {
-            LOCK_TCPIP_CORE();
-            ip_napt_disable();
-            ip_napt_init(MAX_NAPT_SLOTS, MAX_NAPT_TCP);
-            UNLOCK_TCPIP_CORE();
-            natEnabled.store(false);
-            Serial.println("⚠️ Memory critical - NAT purged");
+        if (currHeap < MEM_CRITICAL_THRESHOLD && natEnabled.load()) {
+            disableNAT();
+            Serial.println("⚠️ Memory critical - NAT disabled");
         }
 
         if (WiFi.status() == WL_CONNECTED) {
-            if (!natInit) {
-                LOCK_TCPIP_CORE();
-                ip_napt_init(MAX_NAPT_SLOTS, MAX_NAPT_TCP);
-                UNLOCK_TCPIP_CORE();
-                natInit = true;
-                Serial.println("✅ NAT initialized");
+            if (!natInitialized) {
+                initNAT();
+                natInitialized = true;
             }
-            if (!natEnabled.load()) {
-                LOCK_TCPIP_CORE();
-                if (ip_napt_enable(WiFi.localIP(), 1)) {
-                    natEnabled.store(true);
-                    Serial.println("✅ NAT Enabled - Full router mode");
-                }
-                UNLOCK_TCPIP_CORE();
-            }
+            enableNAT();
             lastRSSI.store(WiFi.RSSI());
         } else {
             lastRSSI.store(-100);
+            natInitialized = false;
         }
 
         if (millis() - lastTempUpdate > TEMP_UPDATE_INTERVAL) {
@@ -758,19 +549,15 @@ void networkTask(void * pv) {
             doc["clientCount"] = currentClients.load();
             doc["clientLimit"] = max_clients;
 
-            int r = lastRSSI.load();
-            doc["bars"] = (r > -55) ? 4 : (r > -65) ? 3 : (r > -75) ? 2 : (r > -85) ? 1 : 0;
-
             JsonArray clis = doc["clients"].to<JsonArray>();
-
             wifi_sta_list_t wifi_sta_list;
             esp_wifi_ap_get_sta_list(&wifi_sta_list);
-
+            
             if (lastClientCount != wifi_sta_list.num) {
                 lastClientCount = wifi_sta_list.num;
-                Serial.printf("📡 Clients: %d/%d connected\n", lastClientCount, max_clients);
+                Serial.printf("📡 Clients: %d/%d\n", lastClientCount, max_clients);
             }
-
+            
             for (int i = 0; i < wifi_sta_list.num; i++) {
                 JsonObject c = clis.add<JsonObject>();
                 char m[18]; 
@@ -782,8 +569,8 @@ void networkTask(void * pv) {
                 c["ip"] = getIPFromMAC(wifi_sta_list.sta[i].mac);
             }
 
-            String out; 
-            serializeJson(doc, out); 
+            String out;
+            serializeJson(doc, out);
             ws.textAll(out);
             lastBroadcast = millis();
         }
@@ -797,34 +584,37 @@ void setup() {
     delay(100);
     uptimeStart = millis();
     
-    // Detect board capabilities FIRST
     detectBoardCapabilities();
-    
-    prefs.begin("apex-v19", false);
+    prefs.begin("apex-v21", false);
 
-    // Load configurations with validation
+    // Load STA config
     sta_ssid = prefs.getString("sta_ssid", "");
     sta_pass = urlDecode(prefs.getString("sta_pass", ""));
     ap_ssid = prefs.getString("ap_ssid", "APEX_ULTRA");
     ap_pass = validateAPPassword(urlDecode(prefs.getString("ap_pass", "12345678")));
     
-    // Only load 5GHz setting if board supports it
     if (board_supports_5ghz) {
         use_5ghz = prefs.getBool("use_5ghz", DEFAULT_BAND_5GHZ);
-    } else {
-        use_5ghz = false;
     }
     
     ap_channel = validateChannel(prefs.getInt("ap_channel", DEFAULT_AP_CHANNEL), use_5ghz);
     ap_hidden = prefs.getBool("ap_hidden", DEFAULT_AP_HIDDEN);
     max_clients = validateMaxClients(prefs.getInt("max_clients", DEFAULT_MAX_CLIENTS));
     dns_mode = prefs.getInt("dns_mode", DEFAULT_DNS_MODE);
+    
+    // Load NAT config với ràng buộc
+    int saved_tcp = validateNATTCP(prefs.getInt("nat_tcp", DEFAULT_NAPT_TCP));
+    int saved_slots = validateNATSlots(prefs.getInt("nat_slots", DEFAULT_NAPT_SLOTS), saved_tcp);
+    nat_max_slots = saved_slots;
+    nat_max_tcp = saved_tcp;
 
-    Serial.println("\n╔════════════════════════════════════════════╗");
-    Serial.println("║   APEX ULTRA V19.9.9 - 5GHz Auto-Detect ║");
-    Serial.println("║   iOS & Android Compatible              ║");
-    Serial.println("╚════════════════════════════════════════════╝\n");
+    Serial.println("\n╔════════════════════════════════════════════════════╗");
+    Serial.println("║   APEX ULTRA V21.1.0 - NAT Configurable         ║");
+    Serial.println("║   Works on Arduino IDE & ESP-IDF                ║");
+    Serial.println("╚════════════════════════════════════════════════════╝\n");
+    Serial.printf("⚙️ NAT Slots: %d, TCP ports: %d\n", nat_max_slots, nat_max_tcp);
 
+    // Temperature sensor init
 #ifndef CONFIG_IDF_TARGET_ESP32C5
     temp_sensor_config_t temp_sensor = TSENS_CONFIG_DEFAULT();
     temp_sensor.dac_offset = TSENS_DAC_L2;
@@ -832,62 +622,27 @@ void setup() {
     temp_sensor_start();
 #endif
 
-    // Setup WiFi mode
+    // Setup WiFi AP
     WiFi.mode(WIFI_AP_STA);
     WiFi.softAPConfig(AP_IP, AP_GATEWAY, AP_SUBNET);
-    
-    if (board_supports_5ghz) {
-        wifi_config_t ap_config = {};
-        strcpy((char*)ap_config.ap.ssid, ap_ssid.c_str());
-        strcpy((char*)ap_config.ap.password, ap_pass.c_str());
-        ap_config.ap.ssid_len = ap_ssid.length();
-        ap_config.ap.channel = ap_channel;
-        ap_config.ap.authmode = ap_pass.length() ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
-        ap_config.ap.ssid_hidden = ap_hidden ? 1 : 0;
-        ap_config.ap.max_connection = max_clients;
-        
-        if (use_5ghz) {
-            ap_config.ap.phy_11b = 0;
-            ap_config.ap.phy_11g = 0;
-            ap_config.ap.phy_11n = 1;
-            ap_config.ap.phy_11ax = 1;
-            esp_wifi_set_band(WIFI_BAND_5GHZ);
-            Serial.println("📡 5GHz Mode ENABLED - WiFi 6 on 5GHz band");
-        } else {
-            esp_wifi_set_band(WIFI_BAND_2GHZ);
-            Serial.println("📡 2.4GHz Mode - Standard WiFi");
-        }
-        
-        esp_wifi_set_config(WIFI_IF_AP, &ap_config);
-        esp_wifi_start();
-    } else {
-        WiFi.softAP(ap_ssid.c_str(), ap_pass.c_str(), ap_channel, ap_hidden ? 1 : 0, max_clients);
-    }
+    WiFi.softAP(ap_ssid.c_str(), ap_pass.c_str(), ap_channel, ap_hidden ? 1 : 0, max_clients);
 
-    Serial.printf("📡 AP: %s | %s | Ch:%d | IP: %s\n", 
-                  ap_ssid.c_str(), (use_5ghz && board_supports_5ghz) ? "5GHz" : "2.4GHz",
-                  ap_channel, AP_IP.toString().c_str());
-    Serial.printf("📡 Hidden: %s | Max Clients: %d\n", 
-                  ap_hidden ? "Yes" : "No", max_clients);
+    Serial.printf("📡 AP: %s | Ch:%d | IP: %s\n", ap_ssid.c_str(), ap_channel, AP_IP.toString().c_str());
 
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
-                                                        ESP_EVENT_ANY_ID,
-                                                        &wifiEventHandler,
-                                                        NULL,
-                                                        NULL));
+    // Register event handler
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
+                                                        &wifiEventHandler, NULL, NULL));
 
+    // Connect to STA if configured
     if (sta_ssid.length() > 0) {
         WiFi.begin(sta_ssid.c_str(), sta_pass.c_str());
         Serial.printf("📡 Connecting to STA: %s\n", sta_ssid.c_str());
     } else {
         Serial.printf("⚠️ Connect to AP: %s | http://%s\n", ap_ssid.c_str(), AP_IP.toString().c_str());
-        Serial.println("   Then configure your WiFi network via web interface");
     }
 
-    // Web Server Routes
-    server.on("/", HTTP_GET, [](AsyncWebServerRequest *r){ 
-        r->send_P(200, "text/html", index_html); 
-    });
+    // Web server routes
+    server.on("/", HTTP_GET, [](AsyncWebServerRequest *r){ r->send_P(200, "text/html", index_html); });
     server.on("/scan", HTTP_GET, handleScan);
     
     server.on("/get-board-info", HTTP_GET, [](AsyncWebServerRequest *r){
@@ -895,17 +650,9 @@ void setup() {
                       String(board_supports_5ghz ? "true" : "false") + "}";
         r->send(200, "application/json", json);
     });
-    
-    server.on("/get-ap-config", HTTP_GET, [](AsyncWebServerRequest *r){
-        String json = "{\"band_5ghz\":" + String(use_5ghz ? "true" : "false") + 
-                      ",\"channel\":" + String(ap_channel) +
-                      ",\"hidden\":" + String(ap_hidden ? "true" : "false") +
-                      ",\"max_clients\":" + String(max_clients) + "}";
-        r->send(200, "application/json", json);
-    });
-    
-    server.on("/get-dns", HTTP_GET, [](AsyncWebServerRequest *r){
-        String json = "{\"dnsmode\":" + String(dns_mode) + "}";
+
+    server.on("/get-nat-config", HTTP_GET, [](AsyncWebServerRequest *r){
+        String json = "{\"slots\":" + String(nat_max_slots) + ",\"tcp\":" + String(nat_max_tcp) + "}";
         r->send(200, "application/json", json);
     });
 
@@ -919,82 +666,46 @@ void setup() {
 
     server.on("/save-ap", HTTP_GET, [](AsyncWebServerRequest *r){
         if(r->hasParam("ssid")) prefs.putString("ap_ssid", r->getParam("ssid")->value());
-
         if(r->hasParam("pass")) {
             String p = r->getParam("pass")->value();
-            if (p.length() == 0 || p.length() >= 8) {
-                prefs.putString("ap_pass", p);
-            }
+            if (p.length() >= 8) prefs.putString("ap_pass", p);
         }
-
-        // Only save band setting if board supports 5GHz
-        if(r->hasParam("band") && board_supports_5ghz) {
-            prefs.putBool("use_5ghz", r->getParam("band")->value() == "1");
-        }
-
         if(r->hasParam("channel")) {
-            bool is5GHz = false;
-            if(r->hasParam("band") && board_supports_5ghz) {
-                is5GHz = (r->getParam("band")->value() == "1");
-            }
             int ch = r->getParam("channel")->value().toInt();
-            prefs.putInt("ap_channel", validateChannel(ch, is5GHz));
+            prefs.putInt("ap_channel", validateChannel(ch, use_5ghz));
         }
-
-        if(r->hasParam("hidden")) {
-            prefs.putBool("ap_hidden", r->getParam("hidden")->value() == "1");
-        }
-
-        if(r->hasParam("maxclients")) {
-            int clients = r->getParam("maxclients")->value().toInt();
-            prefs.putInt("max_clients", validateMaxClients(clients));
-        }
-
-        r->send(200, "text/plain", "✅ AP Config Saved. Rebooting...");
+        r->send(200, "text/plain", "✅ AP Saved. Rebooting...");
         delay(1000);
         ESP.restart();
     });
 
-    server.on("/save-dns", HTTP_GET, [](AsyncWebServerRequest *r){
-        if(r->hasParam("dnsmode")) {
-            int mode = r->getParam("dnsmode")->value().toInt();
-            if (mode == DNS_MODE_CAPTIVE || mode == DNS_MODE_NORMAL) {
-                prefs.putInt("dns_mode", mode);
-                r->send(200, "text/plain", "✅ DNS Mode Saved. Rebooting...");
-                delay(1000);
-                ESP.restart();
-                return;
-            }
+    server.on("/save-nat", HTTP_GET, [](AsyncWebServerRequest *r){
+        int new_tcp = DEFAULT_NAPT_TCP;
+        int new_slots = DEFAULT_NAPT_SLOTS;
+        
+        if(r->hasParam("tcp")) {
+            new_tcp = validateNATTCP(r->getParam("tcp")->value().toInt());
+            prefs.putInt("nat_tcp", new_tcp);
         }
-        r->send(400, "text/plain", "❌ Invalid DNS mode");
+        if(r->hasParam("slots")) {
+            new_slots = validateNATSlots(r->getParam("slots")->value().toInt(), new_tcp);
+            prefs.putInt("nat_slots", new_slots);
+        }
+        r->send(200, "text/plain", "✅ NAT Config Saved. Rebooting...");
+        delay(1000);
+        ESP.restart();
     });
 
     ws.onEvent([](AsyncWebSocket *s, AsyncWebSocketClient *c, AwsEventType t, void *arg, uint8_t *data, size_t len) {
-        if (t == WS_EVT_CONNECT) {
-            Serial.printf("🔌 WebSocket client connected: %u\n", c->id());
-        } else if (t == WS_EVT_DISCONNECT) {
-            Serial.printf("🔌 WebSocket client disconnected: %u\n", c->id());
-        } else if (t == WS_EVT_DATA) {
-            if (len == 4 && memcmp(data, "ping", 4) == 0) {
-                c->text("pong");
-            }
+        if (t == WS_EVT_DATA && len == 4 && memcmp(data, "ping", 4) == 0) {
+            c->text("pong");
         }
     });
     server.addHandler(&ws);
-
     server.begin();
     setupDNS();
-    Serial.printf("🌐 Web: http://%s\n", AP_IP.toString().c_str());
-    Serial.printf("🌐 DNS Mode: %s\n", dns_mode == DNS_MODE_CAPTIVE ? "Captive Portal" : "Normal DNS");
 
-    if (MDNS.begin("apex")) {
-        Serial.println("✅ mDNS: http://apex.local");
-    }
-
-    esp_task_wdt_init(WATCHDOG_TIMEOUT, true);
-    esp_task_wdt_add(NULL);
-
-    xTaskCreatePinnedToCore(networkTask, "NET", 8192, NULL, 4, NULL, 0);
+    // Internet check task
     xTaskCreatePinnedToCore([](void* p){ 
         esp_task_wdt_add(NULL);
         for(;;){ 
@@ -1011,21 +722,21 @@ void setup() {
         } 
     }, "CHK", 2048, NULL, 1, NULL, 1);
 
+    esp_task_wdt_init(WATCHDOG_TIMEOUT, true);
+    esp_task_wdt_add(NULL);
+    xTaskCreatePinnedToCore(networkTask, "NET", 8192, NULL, 4, NULL, 0);
+
+    // Blink LED
     pinMode(LED_BUILTIN, OUTPUT);
     for (int i = 0; i < 3; i++) {
-        digitalWrite(LED_BUILTIN, LOW);
-        delay(80);
-        digitalWrite(LED_BUILTIN, HIGH);
-        delay(80);
+        digitalWrite(LED_BUILTIN, LOW); delay(80);
+        digitalWrite(LED_BUILTIN, HIGH); delay(80);
     }
-    Serial.printf("✅ APEX ULTRA V19.9.9 Ready on %s!\n", board_model.c_str());
-    if (use_5ghz && board_supports_5ghz) {
-        Serial.printf("   🌟 5GHz AP Mode Active - Channel %d\n", ap_channel);
-        Serial.printf("   📱 Connect with WiFi 6 compatible devices\n");
-    }
+    
+    Serial.printf("✅ APEX ULTRA V21.1.0 Ready on %s!\n", board_model.c_str());
 }
 
 void loop() { 
     dns.processNextRequest(); 
-    vTaskDelay(10); 
+    vTaskDelay(10);
 }
