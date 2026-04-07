@@ -1,4 +1,4 @@
-name: APEX-ULTRA-Full-Variant-Build
+name: APEX-ULTRA-Universal-Build
 
 on:
   push:
@@ -12,27 +12,37 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Nhóm ESP32 Classic (WROOM-32/32D/32E/32U/PICO-D4)
-          - id: "ESP32_Classic"
+          # 1. Nhóm ESP32 Classic (WROOM-32, 32U, 32D, 32E, PICO-D4)
+          # Tất cả các bản này dùng chung cấu hình chip 'esp32'
+          - id: "ESP32_Standard_WROOM_PICO"
             target: "esp32"
             flash: "4MB"
-          
-          # ESP32-S3 Biến thể N8 (8MB Flash)
+            psram: "none"
+
+          # 2. ESP32-S2 (Single Core, limited NAT slots)
+          - id: "ESP32_S2"
+            target: "esp32s2"
+            flash: "4MB"
+            psram: "none"
+
+          # 3. ESP32-S3 N8 (8MB Flash, No PSRAM)
           - id: "ESP32_S3_N8"
             target: "esp32s3"
             flash: "8MB"
             psram: "none"
 
-          # ESP32-S3 Biến thể N16R8 (16MB Flash + 8MB PSRAM)
+          # 4. ESP32-S3 N16R8 (16MB Flash, 8MB PSRAM Octal)
+          # Biến thể mạnh nhất cho NAT Router
           - id: "ESP32_S3_N16R8"
             target: "esp32s3"
             flash: "16MB"
             psram: "opi"
 
-          # ESP32-C5 (Dòng Dual-band mới)
+          # 5. ESP32-C5 (Bản Beta/Early support cho Dual-band)
           - id: "ESP32_C5"
             target: "esp32c5"
             flash: "4MB"
+            psram: "none"
 
     steps:
       - name: Checkout Code
@@ -46,18 +56,22 @@ jobs:
           esp_idf_version: v5.1
           target: ${{ matrix.target }}
           command: |
-            # 1. Tải Arduino Core và các thư viện cần thiết
+            # Tự động tạo cấu hình thư mục components
             mkdir -p components
+            
+            # Tải Arduino Core và các thư viện cần thiết (Deep 1 để build nhanh)
             git clone --recursive --depth 1 https://github.com/espressif/arduino-esp32.git components/arduino
             git clone --depth 1 https://github.com/me-no-dev/AsyncTCP.git components/AsyncTCP
             git clone --depth 1 https://github.com/me-no-dev/ESPAsyncWebServer.git components/ESPAsyncWebServer
             git clone --depth 1 https://github.com/bblanchon/ArduinoJson.git components/ArduinoJson
 
-            # 2. Cấu hình sdkconfig.defaults
+            # Tạo file cấu hình sdkconfig.defaults sạch
             echo "CONFIG_AUTOSTART_ARDUINO=y" > sdkconfig.defaults
+            echo "CONFIG_FREERTOS_HZ=1000" >> sdkconfig.defaults
             echo "CONFIG_LWIP_IPV4_NAPT=y" >> sdkconfig.defaults
-            
-            # Cấu hình Flash theo Matrix
+            echo "CONFIG_LWIP_IP_FORWARD=y" >> sdkconfig.defaults
+
+            # Cấu hình Flash Size
             if [ "${{ matrix.flash }}" = "16MB" ]; then
               echo "CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y" >> sdkconfig.defaults
             elif [ "${{ matrix.flash }}" = "8MB" ]; then
@@ -66,16 +80,17 @@ jobs:
               echo "CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y" >> sdkconfig.defaults
             fi
 
-            # Cấu hình PSRAM cho bản N16R8
+            # Cấu hình PSRAM cho S3 N16R8
             if [ "${{ matrix.psram }}" = "opi" ]; then
               echo "CONFIG_SPIRAM=y" >> sdkconfig.defaults
               echo "CONFIG_SPIRAM_MODE_OCT=y" >> sdkconfig.defaults
+              echo "CONFIG_SPIRAM_TYPE_AUTO=y" >> sdkconfig.defaults
             fi
 
-            # 3. Biên dịch
+            # Lệnh build chính (Tên project là APEX_ULTRA theo CMakeLists.txt gốc)
             idf.py build
             
-            # 4. Đổi tên file đầu ra dựa trên Project Name (APEX_ULTRA)
+            # Đổi tên file để không bị ghi đè khi upload artifact
             mv build/APEX_ULTRA.bin build/APEX_${{ matrix.id }}.bin
 
       - name: Upload Artifacts
