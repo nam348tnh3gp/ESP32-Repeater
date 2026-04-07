@@ -1,7 +1,9 @@
 cmake_minimum_required(VERSION 3.16)
 
-# Ép IDF tìm kiếm thư viện trong thư mục components (CI sẽ tự tạo thư mục này)
+# Cho phép tìm các thư viện trong thư mục components
 set(EXTRA_COMPONENT_DIRS "components")
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+
+# Tên project phải khớp với lệnh mv trong file .yml
 project(APEX_ULTRA)
