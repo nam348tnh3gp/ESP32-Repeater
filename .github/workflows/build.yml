@@ -1,4 +1,4 @@
-name: APEX-ULTRA-Universal-Build
+name: APEX-ULTRA-Universal-Build-Fixed
 
 on:
   push:
@@ -12,86 +12,69 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # 1. Nhóm ESP32 Classic (WROOM-32, 32U, 32D, 32E, PICO-D4)
-          # Tất cả các bản này dùng chung cấu hình chip 'esp32'
-          - id: "ESP32_Standard_WROOM_PICO"
+          - id: "ESP32_Standard"
             target: "esp32"
             flash: "4MB"
-            psram: "none"
-
-          # 2. ESP32-S2 (Single Core, limited NAT slots)
           - id: "ESP32_S2"
             target: "esp32s2"
             flash: "4MB"
-            psram: "none"
-
-          # 3. ESP32-S3 N8 (8MB Flash, No PSRAM)
-          - id: "ESP32_S3_N8"
-            target: "esp32s3"
-            flash: "8MB"
-            psram: "none"
-
-          # 4. ESP32-S3 N16R8 (16MB Flash, 8MB PSRAM Octal)
-          # Biến thể mạnh nhất cho NAT Router
           - id: "ESP32_S3_N16R8"
             target: "esp32s3"
             flash: "16MB"
             psram: "opi"
-
-          # 5. ESP32-C5 (Bản Beta/Early support cho Dual-band)
-          - id: "ESP32_C5"
-            target: "esp32c5"
+          - id: "ESP32_C3" # Thay C5 bằng C3 nếu v5.1 chưa hỗ trợ tốt C5
+            target: "esp32c3"
             flash: "4MB"
-            psram: "none"
 
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
-        with:
-          submodules: 'recursive'
 
       - name: Build with ESP-IDF
         uses: espressif/esp-idf-ci-action@v1
         with:
+          # Ép xung về v5.1 để tương thích hoàn hảo với Arduino Core
           esp_idf_version: v5.1
           target: ${{ matrix.target }}
           command: |
-            # Tự động tạo cấu hình thư mục components
+            # 1. Tạo cấu hình sạch
+            rm -rf components
             mkdir -p components
             
-            # Tải Arduino Core và các thư viện cần thiết (Deep 1 để build nhanh)
-            git clone --recursive --depth 1 https://github.com/espressif/arduino-esp32.git components/arduino
+            # 2. Tải các component với nhánh (branch) ổn định
+            git clone --recursive --branch esp-idf-v5.1-libs --depth 1 https://github.com/espressif/arduino-esp32.git components/arduino
             git clone --depth 1 https://github.com/me-no-dev/AsyncTCP.git components/AsyncTCP
             git clone --depth 1 https://github.com/me-no-dev/ESPAsyncWebServer.git components/ESPAsyncWebServer
             git clone --depth 1 https://github.com/bblanchon/ArduinoJson.git components/ArduinoJson
 
-            # Tạo file cấu hình sdkconfig.defaults sạch
+            # 3. Cấu hình hệ thống (sdkconfig)
             echo "CONFIG_AUTOSTART_ARDUINO=y" > sdkconfig.defaults
-            echo "CONFIG_FREERTOS_HZ=1000" >> sdkconfig.defaults
             echo "CONFIG_LWIP_IPV4_NAPT=y" >> sdkconfig.defaults
             echo "CONFIG_LWIP_IP_FORWARD=y" >> sdkconfig.defaults
-
-            # Cấu hình Flash Size
+            
+            # Xử lý Flash/PSRAM
             if [ "${{ matrix.flash }}" = "16MB" ]; then
               echo "CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y" >> sdkconfig.defaults
-            elif [ "${{ matrix.flash }}" = "8MB" ]; then
-              echo "CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y" >> sdkconfig.defaults
             else
               echo "CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y" >> sdkconfig.defaults
             fi
 
-            # Cấu hình PSRAM cho S3 N16R8
             if [ "${{ matrix.psram }}" = "opi" ]; then
               echo "CONFIG_SPIRAM=y" >> sdkconfig.defaults
               echo "CONFIG_SPIRAM_MODE_OCT=y" >> sdkconfig.defaults
-              echo "CONFIG_SPIRAM_TYPE_AUTO=y" >> sdkconfig.defaults
             fi
 
-            # Lệnh build chính (Tên project là APEX_ULTRA theo CMakeLists.txt gốc)
+            # 4. Biên dịch
+            # Dùng --ccache để tăng tốc nếu chạy lại
             idf.py build
             
-            # Đổi tên file để không bị ghi đè khi upload artifact
-            mv build/APEX_ULTRA.bin build/APEX_${{ matrix.id }}.bin
+            # 5. Kiểm tra và di chuyển file
+            if [ -f build/APEX_ULTRA.bin ]; then
+              mv build/APEX_ULTRA.bin build/APEX_${{ matrix.id }}.bin
+            else
+              echo "Build failed, .bin not found!"
+              exit 1
+            fi
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
