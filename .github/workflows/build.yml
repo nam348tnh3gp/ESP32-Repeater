@@ -1,27 +1,4 @@
-name: APEX-ULTRA-Final-Fix
-
-on:
-  push:
-    branches: [ "main", "master" ]
-  workflow_dispatch:
-
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - id: "ESP32_Standard"
-            target: "esp32"
-          - id: "ESP32_S3_N16R8"
-            target: "esp32s3"
-
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-      - name: Build with ESP-IDF
+- name: Build with ESP-IDF
         uses: espressif/esp-idf-ci-action@v1
         with:
           esp_idf_version: v5.1
@@ -31,37 +8,28 @@ jobs:
             rm -rf components build dependencies.lock
             mkdir -p components
             
-            # 2. Clone Arduino core - Ép tên thư mục là arduino-esp32
-            # Sử dụng --depth 1 để tránh overload băng thông dẫn đến clone lỗi
-            git clone --recursive --branch esp-idf-v5.1-libs --depth 1 https://github.com/espressif/arduino-esp32.git components/arduino-esp32
+            # 2. Clone Arduino core (Chỉ lấy nhánh cần thiết, không lấy toàn bộ lịch sử)
+            # Chúng ta chia nhỏ lệnh clone để tránh lỗi mạng
+            git clone --branch esp-idf-v5.1-libs --depth 1 https://github.com/espressif/arduino-esp32.git components/arduino-esp32
+            cd components/arduino-esp32
+            git submodule update --init --recursive --depth 1
+            cd ../..
             
-            # 3. Clone các thư viện cần thiết khác
+            # 3. Clone các thư viện mạng
             git clone --depth 1 https://github.com/me-no-dev/AsyncTCP.git components/AsyncTCP
             git clone --depth 1 https://github.com/me-no-dev/ESPAsyncWebServer.git components/ESPAsyncWebServer
             git clone --depth 1 https://github.com/bblanchon/ArduinoJson.git components/ArduinoJson
 
-            # 4. DEBUG: Kiểm tra xem các thư mục đã nằm đúng vị trí chưa
-            echo "--- CHECKING COMPONENTS DIR ---"
+            # 4. DEBUG: Kiểm tra lại xem thư mục arduino-esp32 đã xuất hiện chưa
             ls -d components/*/ 
-            
-            # 5. Tạo file cấu hình tối thiểu
+
+            # 5. Cấu hình & Build
             echo "CONFIG_AUTOSTART_ARDUINO=y" > sdkconfig.defaults
             echo "CONFIG_LWIP_IPV4_NAPT=y" >> sdkconfig.defaults
             echo "CONFIG_LWIP_IP_FORWARD=y" >> sdkconfig.defaults
-
-            # 6. Biên dịch với ccache để tối ưu
+            
             idf.py build
             
-            # 7. Di chuyển file bin (nếu build thành công)
             if [ -f build/APEX_ULTRA.bin ]; then
               mv build/APEX_ULTRA.bin build/APEX_${{ matrix.id }}.bin
             fi
-
-      - name: Upload Artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: Firmware-${{ matrix.id }}
-          path: |
-            build/APEX_${{ matrix.id }}.bin
-            build/bootloader/bootloader.bin
-            build/partition_table/partition-table.bin
