@@ -1,4 +1,3 @@
-# .github/workflows/build.yml
 name: Build ESP32-C5 Firmware with PlatformIO
 
 on:
@@ -32,15 +31,25 @@ jobs:
       - name: Install PlatformIO Core
         run: pip install --upgrade platformio
 
+      - name: Clean PlatformIO cache
+        run: |
+          rm -rf ~/.platformio/platforms
+          rm -rf ~/.platformio/.cache
+
+      - name: Update PlatformIO
+        run: |
+          pio platform update
+          pio pkg update
+
       - name: Build firmware
         run: pio run
 
       - name: List build artifacts
-        run: ls -la .pio/build/seeed-xiao-esp32-c5/
+        run: ls -la .pio/build/esp32-c5-devkitc-1/
 
       - name: Upload firmware binary
         uses: actions/upload-artifact@v4
         with:
           name: esp32-c5-firmware
-          path: .pio/build/seeed-xiao-esp32-c5/firmware.bin
-          retention-days: 90
+          path: .pio/build/esp32-c5-devkitc-1/firmware.bin
+          retention-days: 30
