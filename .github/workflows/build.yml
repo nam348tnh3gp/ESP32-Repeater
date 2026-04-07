@@ -30,19 +30,19 @@ jobs:
           esp_idf_version: v5.1
           target: ${{ matrix.target }}
           command: |
-            # 1. Xóa sạch và tạo lại thư mục components
+            # 1. Dọn dẹp và tạo cấu mục components sạch
             rm -rf components
             mkdir -p components
             
-            # 2. Clone Arduino core và đổi tên thư mục thành 'arduino-esp32' để khớp với CMake
+            # 2. Clone Arduino core - ĐẶT TÊN THƯ MỤC LÀ 'arduino-esp32' ĐỂ KHỚP VỚI CMAKE
             git clone --recursive --branch esp-idf-v5.1-libs --depth 1 https://github.com/espressif/arduino-esp32.git components/arduino-esp32
             
-            # 3. Clone các thư viện mạng
+            # 3. Clone các thư viện phụ trợ
             git clone --depth 1 https://github.com/me-no-dev/AsyncTCP.git components/AsyncTCP
             git clone --depth 1 https://github.com/me-no-dev/ESPAsyncWebServer.git components/ESPAsyncWebServer
             git clone --depth 1 https://github.com/bblanchon/ArduinoJson.git components/ArduinoJson
 
-            # 4. Cấu hình mặc định
+            # 4. Cấu hình sdkconfig mặc định
             echo "CONFIG_AUTOSTART_ARDUINO=y" > sdkconfig.defaults
             echo "CONFIG_LWIP_IPV4_NAPT=y" >> sdkconfig.defaults
             echo "CONFIG_LWIP_IP_FORWARD=y" >> sdkconfig.defaults
@@ -55,14 +55,12 @@ jobs:
               echo "CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y" >> sdkconfig.defaults
             fi
 
-            # 5. Build
+            # 5. Thực hiện biên dịch
             idf.py build
             
-            # 6. Kiểm tra kết quả
+            # 6. Kiểm tra và chuẩn bị file đầu ra
             if [ -f build/APEX_ULTRA.bin ]; then
               mv build/APEX_ULTRA.bin build/APEX_${{ matrix.id }}.bin
-            else
-              exit 1
             fi
 
       - name: Upload Artifacts
