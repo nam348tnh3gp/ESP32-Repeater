@@ -14,11 +14,8 @@ jobs:
         include:
           - id: "ESP32_Standard"
             target: "esp32"
-            flash: "4MB"
           - id: "ESP32_S3_N16R8"
             target: "esp32s3"
-            flash: "16MB"
-            psram: "opi"
 
     steps:
       - name: Checkout Code
@@ -30,35 +27,32 @@ jobs:
           esp_idf_version: v5.1
           target: ${{ matrix.target }}
           command: |
-            # 1. Dọn dẹp và tạo cấu mục components sạch
-            rm -rf components
+            # 1. Dọn dẹp tuyệt đối
+            rm -rf components build dependencies.lock
             mkdir -p components
             
-            # 2. Clone Arduino core - ĐẶT TÊN THƯ MỤC LÀ 'arduino-esp32' ĐỂ KHỚP VỚI CMAKE
+            # 2. Clone Arduino core - Ép tên thư mục là arduino-esp32
+            # Sử dụng --depth 1 để tránh overload băng thông dẫn đến clone lỗi
             git clone --recursive --branch esp-idf-v5.1-libs --depth 1 https://github.com/espressif/arduino-esp32.git components/arduino-esp32
             
-            # 3. Clone các thư viện phụ trợ
+            # 3. Clone các thư viện cần thiết khác
             git clone --depth 1 https://github.com/me-no-dev/AsyncTCP.git components/AsyncTCP
             git clone --depth 1 https://github.com/me-no-dev/ESPAsyncWebServer.git components/ESPAsyncWebServer
             git clone --depth 1 https://github.com/bblanchon/ArduinoJson.git components/ArduinoJson
 
-            # 4. Cấu hình sdkconfig mặc định
+            # 4. DEBUG: Kiểm tra xem các thư mục đã nằm đúng vị trí chưa
+            echo "--- CHECKING COMPONENTS DIR ---"
+            ls -d components/*/ 
+            
+            # 5. Tạo file cấu hình tối thiểu
             echo "CONFIG_AUTOSTART_ARDUINO=y" > sdkconfig.defaults
             echo "CONFIG_LWIP_IPV4_NAPT=y" >> sdkconfig.defaults
             echo "CONFIG_LWIP_IP_FORWARD=y" >> sdkconfig.defaults
-            
-            if [ "${{ matrix.flash }}" = "16MB" ]; then
-              echo "CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y" >> sdkconfig.defaults
-              echo "CONFIG_SPIRAM=y" >> sdkconfig.defaults
-              echo "CONFIG_SPIRAM_MODE_OCT=y" >> sdkconfig.defaults
-            else
-              echo "CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y" >> sdkconfig.defaults
-            fi
 
-            # 5. Thực hiện biên dịch
+            # 6. Biên dịch với ccache để tối ưu
             idf.py build
             
-            # 6. Kiểm tra và chuẩn bị file đầu ra
+            # 7. Di chuyển file bin (nếu build thành công)
             if [ -f build/APEX_ULTRA.bin ]; then
               mv build/APEX_ULTRA.bin build/APEX_${{ matrix.id }}.bin
             fi
