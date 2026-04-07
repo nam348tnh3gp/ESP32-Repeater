@@ -19,6 +19,7 @@ This firmware has been tested and verified on the following ESP32 boards:
 * **ESP32-WROOM-32D**
 * **ESP32-WROOM-32E**
 * **ESP32-S2 / S3** (limited testing, adjust NAT slots)
+* **ESP32-C5**
 * **ESP32-PICO-D4**
 
 > ⚠️ Notes:
