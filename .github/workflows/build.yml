@@ -1,8 +1,8 @@
-name: APEX-ULTRA-Multi-Architecture-Build
+name: APEX-ULTRA-Full-Variant-Build
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "main", "master" ]
   workflow_dispatch:
 
 jobs:
@@ -12,23 +12,24 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Nhóm ESP32 Classic (WROOM, D, E, U, PICO-D4)
+          # Nhóm ESP32 Classic (WROOM-32/32D/32E/32U/PICO-D4)
           - id: "ESP32_Classic"
             target: "esp32"
             flash: "4MB"
           
-          # Nhóm ESP32-S series
-          - id: "ESP32_S2"
-            target: "esp32s2"
-            flash: "4MB"
+          # ESP32-S3 Biến thể N8 (8MB Flash)
           - id: "ESP32_S3_N8"
             target: "esp32s3"
             flash: "8MB"
+            psram: "none"
+
+          # ESP32-S3 Biến thể N16R8 (16MB Flash + 8MB PSRAM)
           - id: "ESP32_S3_N16R8"
             target: "esp32s3"
             flash: "16MB"
+            psram: "opi"
 
-          # Nhóm RISC-V (C series)
+          # ESP32-C5 (Dòng Dual-band mới)
           - id: "ESP32_C5"
             target: "esp32c5"
             flash: "4MB"
@@ -42,39 +43,40 @@ jobs:
       - name: Build with ESP-IDF
         uses: espressif/esp-idf-ci-action@v1
         with:
-          esp_idf_version: v5.1 # C5 yêu cầu version IDF mới
+          esp_idf_version: v5.1
           target: ${{ matrix.target }}
           command: |
-            # 1. Tải và thiết lập Arduino Component + Libraries
+            # 1. Tải Arduino Core và các thư viện cần thiết
             mkdir -p components
-            cd components
-            git clone --recursive https://github.com/espressif/arduino-esp32.git arduino
-            git clone https://github.com/me-no-dev/AsyncTCP.git
-            git clone https://github.com/me-no-dev/ESPAsyncWebServer.git
-            git clone https://github.com/bblanchon/ArduinoJson.git
-            cd ..
+            git clone --recursive --depth 1 https://github.com/espressif/arduino-esp32.git components/arduino
+            git clone --depth 1 https://github.com/me-no-dev/AsyncTCP.git components/AsyncTCP
+            git clone --depth 1 https://github.com/me-no-dev/ESPAsyncWebServer.git components/ESPAsyncWebServer
+            git clone --depth 1 https://github.com/bblanchon/ArduinoJson.git components/ArduinoJson
 
-            # 2. Cấu hình NAT & RAM tối ưu theo Target
+            # 2. Cấu hình sdkconfig.defaults
             echo "CONFIG_AUTOSTART_ARDUINO=y" > sdkconfig.defaults
-            echo "CONFIG_LWIP_IP_FORWARD=y" >> sdkconfig.defaults
             echo "CONFIG_LWIP_IPV4_NAPT=y" >> sdkconfig.defaults
             
-            # Tùy chỉnh Flash Size theo Matrix
-            if [ "${{ matrix.flash }}" = "8MB" ]; then
-              echo "CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y" >> sdkconfig.defaults
-            elif [ "${{ matrix.flash }}" = "16MB" ]; then
+            # Cấu hình Flash theo Matrix
+            if [ "${{ matrix.flash }}" = "16MB" ]; then
               echo "CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y" >> sdkconfig.defaults
-              echo "CONFIG_SPIRAM=y" >> sdkconfig.defaults
-              echo "CONFIG_SPIRAM_MODE_OCT=y" >> sdkconfig.defaults
+            elif [ "${{ matrix.flash }}" = "8MB" ]; then
+              echo "CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y" >> sdkconfig.defaults
             else
               echo "CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y" >> sdkconfig.defaults
             fi
 
-            # 3. Chạy lệnh Build
+            # Cấu hình PSRAM cho bản N16R8
+            if [ "${{ matrix.psram }}" = "opi" ]; then
+              echo "CONFIG_SPIRAM=y" >> sdkconfig.defaults
+              echo "CONFIG_SPIRAM_MODE_OCT=y" >> sdkconfig.defaults
+            fi
+
+            # 3. Biên dịch
             idf.py build
             
-            # 4. Lưu tên file theo biến thể
-            mv build/APEX_ULTRA_S3.bin build/APEX_${{ matrix.id }}.bin
+            # 4. Đổi tên file đầu ra dựa trên Project Name (APEX_ULTRA)
+            mv build/APEX_ULTRA.bin build/APEX_${{ matrix.id }}.bin
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
