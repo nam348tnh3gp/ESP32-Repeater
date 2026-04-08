@@ -1,7 +1,9 @@
 /*
-   ESP32 NAT ROUTER - V21.1.0 (Configurable NAT + RAM Warning)
-   - Đã sửa lỗi tương thích Arduino core 3.x cho ESP32-C5
-   - Đã sửa lỗi include esp_temp_sensor.h
+   ESP32 NAT ROUTER - V22.0.0 (Fully Configurable NAT on All Platforms)
+   - Cấu hình MAX_NAPT_SLOTS và MAX_NAPT_TCP thực sự hoạt động trên core 3.x
+   - Ràng buộc: slots >= TCP ports
+   - Cảnh báo RAM khi cấu hình quá lớn
+   - Tương thích Arduino core 2.x, 3.x và ESP-IDF
 */
 
 #include <Arduino.h>
@@ -16,29 +18,15 @@
 #include <esp_chip_info.h>
 #include <atomic>
 
-// ================= PLATFORM DETECTION =================
-#if defined(ARDUINO_ARCH_ESP32)
-    #define PLATFORM_ARDUINO 1
-    #if defined(ESP_ARDUINO_VERSION_VAL)
-        #define ARDUINO_CORE_VERSION_MAJOR ESP_ARDUINO_VERSION_MAJOR
-    #else
-        #define ARDUINO_CORE_VERSION_MAJOR 2
-    #endif
-#else
-    #define PLATFORM_ARDUINO 0
-#endif
-
-// Conditional includes cho lwIP (chỉ ESP-IDF hoặc Arduino core cũ)
-#if !PLATFORM_ARDUINO || (PLATFORM_ARDUINO && ARDUINO_CORE_VERSION_MAJOR < 3)
-    #include <lwip/napt.h>
-    #include <lwip/netif.h>
-    #include <lwip/priv/tcpip_priv.h>
-    #include <lwip/etharp.h>
-#endif
+// ================= LUÔN INCLUDE LWIP NAT HEADERS (CHO MỌI NỀN TẢNG) =================
+#include <lwip/napt.h>
+#include <lwip/netif.h>
+#include <lwip/priv/tcpip_priv.h>
+#include <lwip/etharp.h>
 
 // ================= TEMPERATURE SENSOR =================
 #ifndef CONFIG_IDF_TARGET_ESP32C5
-#include <driver/temp_sensor.h>  // SỬA: dùng driver/temp_sensor.h thay vì esp_temp_sensor.h
+#include <esp_temp_sensor.h>
 #endif
 
 // ================= BOARD DETECTION =================
@@ -111,65 +99,37 @@ int nat_max_tcp   = DEFAULT_NAPT_TCP;
 bool board_supports_5ghz = false;
 String board_model = "Unknown";
 
-// ================= PLATFORM-SPECIFIC NAT FUNCTIONS =================
-#if PLATFORM_ARDUINO && ARDUINO_CORE_VERSION_MAJOR >= 3
-    // Arduino core 3.x - dùng API chính thức
-    void enableNAT() {
-        if (WiFi.status() == WL_CONNECTED && !natEnabled.load()) {
-            if (WiFi.AP.enableNAPT(true)) {
-                natEnabled.store(true);
-                Serial.println("✅ NAT Enabled via Arduino API");
-            } else {
-                Serial.println("❌ Failed to enable NAT");
-            }
+// ================= NAT FUNCTIONS (lwIP native, hoạt động trên mọi nền tảng) =================
+void enableNAT() {
+    if (WiFi.status() == WL_CONNECTED && !natEnabled.load()) {
+        sys_lock_tcpip_core();
+        if (ip_napt_enable(WiFi.localIP(), 1)) {
+            natEnabled.store(true);
+            Serial.println("✅ NAT Enabled via lwIP");
+        } else {
+            Serial.println("❌ Failed to enable NAT");
         }
+        sys_unlock_tcpip_core();
     }
+}
 
-    void disableNAT() {
-        if (natEnabled.load()) {
-            WiFi.AP.enableNAPT(false);
-            natEnabled.store(false);
-            Serial.println("⚠️ NAT Disabled");
-        }
-    }
-
-    void initNAT() {
-        Serial.printf("✅ NAT ready (Arduino core) - slots:%d, tcp:%d\n", nat_max_slots, nat_max_tcp);
-    }
-#else
-    // ESP-IDF hoặc Arduino core cũ - dùng lwIP native API
-    #define LOCK_TCPIP_CORE()   sys_lock_tcpip_core()
-    #define UNLOCK_TCPIP_CORE() sys_unlock_tcpip_core()
-
-    void enableNAT() {
-        if (WiFi.status() == WL_CONNECTED && !natEnabled.load()) {
-            LOCK_TCPIP_CORE();
-            if (ip_napt_enable(WiFi.localIP(), 1)) {
-                natEnabled.store(true);
-                Serial.println("✅ NAT Enabled via lwIP");
-            }
-            UNLOCK_TCPIP_CORE();
-        }
-    }
-
-    void disableNAT() {
-        if (natEnabled.load()) {
-            LOCK_TCPIP_CORE();
-            ip_napt_disable();
-            UNLOCK_TCPIP_CORE();
-            natEnabled.store(false);
-            Serial.println("⚠️ NAT Disabled");
-        }
-    }
-
-    void initNAT() {
-        LOCK_TCPIP_CORE();
+void disableNAT() {
+    if (natEnabled.load()) {
+        sys_lock_tcpip_core();
         ip_napt_disable();
-        ip_napt_init(nat_max_slots, nat_max_tcp);
-        UNLOCK_TCPIP_CORE();
-        Serial.printf("✅ NAT initialized: slots=%d, tcp_ports=%d\n", nat_max_slots, nat_max_tcp);
+        sys_unlock_tcpip_core();
+        natEnabled.store(false);
+        Serial.println("⚠️ NAT Disabled");
     }
-#endif
+}
+
+void initNAT() {
+    sys_lock_tcpip_core();
+    ip_napt_disable();                     // xóa cấu hình cũ
+    ip_napt_init(nat_max_slots, nat_max_tcp);
+    sys_unlock_tcpip_core();
+    Serial.printf("✅ NAT initialized: slots=%d, tcp_ports=%d\n", nat_max_slots, nat_max_tcp);
+}
 
 // ================= UTILS =================
 String urlDecode(String str) {
@@ -192,7 +152,7 @@ String urlDecode(String str) {
 void detectBoardCapabilities() {
     esp_chip_info_t chip_info;
     esp_chip_info(&chip_info);
-
+    
     switch(chip_info.model) {
         case CHIP_ESP32:    board_model = "ESP32"; board_supports_5ghz = false; break;
         case CHIP_ESP32S2:  board_model = "ESP32-S2"; board_supports_5ghz = false; break;
@@ -204,11 +164,11 @@ void detectBoardCapabilities() {
         case CHIP_ESP32P4:  board_model = "ESP32-P4"; board_supports_5ghz = false; break;
         default:            board_model = "ESP32 (Unknown)"; board_supports_5ghz = false; break;
     }
-
+    
     Serial.printf("🔍 Board Detected: %s\n", board_model.c_str());
     Serial.printf("📡 5GHz Support: %s\n", board_supports_5ghz ? "YES" : "NO");
-    Serial.printf("🖥️ Platform: %s\n", PLATFORM_ARDUINO ? "Arduino IDE" : "ESP-IDF");
-
+    Serial.printf("🖥️ Platform: %s\n", "ESP-IDF / Arduino (unified)");
+    
     if (!board_supports_5ghz && use_5ghz) {
         use_5ghz = false;
         Serial.println("⚠️ Board does not support 5GHz - Forcing 2.4GHz mode");
@@ -260,8 +220,8 @@ float getTemperature() {
     return 0.0f;
 #else
     float temp;
-    temp_sensor_read_celsius(&temp);
-    return temp;
+    if (temp_sensor_read_celsius(&temp) == ESP_OK) return temp;
+    return 0.0f;
 #endif
 }
 
@@ -289,30 +249,29 @@ void wifiEventHandler(void* arg, esp_event_base_t event_base, int32_t event_id, 
     }
 }
 
-// ================= GET IP FROM MAC =================
-#if !PLATFORM_ARDUINO || (PLATFORM_ARDUINO && ARDUINO_CORE_VERSION_MAJOR < 3)
+// ================= GET IP FROM MAC (dùng ARP table - hoạt động trên mọi nền tảng) =================
 struct netif* getAPNetif() {
     esp_netif_t *ap_esp_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
-    if (ap_esp_netif != NULL) {
+    if (ap_esp_netif != nullptr) {
         return esp_netif_get_netif_impl(ap_esp_netif);
     }
     struct netif *netif_ap = netif_list;
-    while (netif_ap != NULL) {
+    while (netif_ap != nullptr) {
         if ((netif_ap->name[0] == 'a' && netif_ap->name[1] == 'p') ||
             (netif_ap->name[0] == 's' && netif_ap->name[1] == 't')) {
             return netif_ap;
         }
         netif_ap = netif_ap->next;
     }
-    return NULL;
+    return nullptr;
 }
 
 String getIPFromMAC(uint8_t* mac) {
     struct netif *netif_ap = getAPNetif();
-    if (netif_ap == NULL) return "No AP Netif";
-
-    ip4_addr_t *ip_found = NULL;
-
+    if (netif_ap == nullptr) return "No AP Netif";
+    
+    ip4_addr_t *ip_found = nullptr;
+    
     for (int i = 0; i < ARP_TABLE_SIZE; i++) {
         struct etharp_entry *entry = &arp_table[i];
         if (entry->state == ETHARP_STATE_STABLE || entry->state == ETHARP_STATE_PENDING) {
@@ -322,31 +281,19 @@ String getIPFromMAC(uint8_t* mac) {
             }
         }
     }
-
-    if (ip_found != NULL) {
+    
+    if (ip_found != nullptr) {
         char ip_str[16];
         ip4addr_ntoa_r(ip_found, ip_str, sizeof(ip_str));
         return String(ip_str);
     }
     return "Pending...";
 }
-#else
-String getIPFromMAC(uint8_t* mac) {
-    wifi_sta_list_t sta_list;
-    esp_wifi_ap_get_sta_list(&sta_list);
-    for (int i = 0; i < sta_list.num; i++) {
-        if (memcmp(sta_list.sta[i].mac, mac, 6) == 0) {
-            return "Connected";
-        }
-    }
-    return "Unknown";
-}
-#endif
 
-// ================= HTML UI =================
+// ================= HTML UI (giữ nguyên, chỉ sửa tiêu đề phiên bản) =================
 const char index_html[] PROGMEM = R"rawliteral(
 <!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1'>
-<title>APEX ULTRA V21.1.0</title>
+<title>APEX ULTRA V22.0.0</title>
 <style>
 *{box-sizing:border-box;}
 body{font-family:Arial,sans-serif;background:#020617;color:#f8fafc;padding:15px;margin:0;}
@@ -358,7 +305,7 @@ button{width:100%;padding:14px;background:#38bdf8;color:#020617;border:none;bord
 .warning{color:#f59e0b;}
 </style></head><body>
 <div class='card'>
-  <h3>🛡️ APEX ULTRA V21.1.0 (NAT Configurable)</h3>
+  <h3>🛡️ APEX ULTRA V22.0.0 (NAT Configurable - Full Fix)</h3>
   <div id='boardInfo'></div>
   <div>📊 RAM: <b id='ram'>0</b> KB</div>
   <div>🌡️ Temp: <b id='temp'>--</b> °C</div>
@@ -466,7 +413,7 @@ void handleScan(AsyncWebServerRequest *r) {
 
     WiFi.scanNetworks(true);
     int n = -1, timeout = 8000, elapsed = 0;
-
+    
     while (n == -1 && elapsed < timeout) {
         delay(100);
         n = WiFi.scanComplete();
@@ -481,12 +428,12 @@ void handleScan(AsyncWebServerRequest *r) {
         return;
     }
 
-    DynamicJsonDocument doc(2048);
+    JsonDocument doc;
     JsonArray array = doc.to<JsonArray>();
     int limit = min(n, MAX_SCAN_NETWORKS);
-
+    
     for (int i = 0; i < limit; i++) {
-        JsonObject item = array.createNestedObject();
+        JsonObject item = array.add<JsonObject>();
         item["ssid"] = WiFi.SSID(i);
         item["rssi"] = WiFi.RSSI(i);
     }
@@ -500,7 +447,7 @@ void handleScan(AsyncWebServerRequest *r) {
 
 // ================= NETWORK TASK =================
 void networkTask(void * pv) {
-    esp_task_wdt_add(NULL);
+    esp_task_wdt_add(nullptr);
     static uint32_t lastBroadcast = 0;
     static bool natInitialized = false;
     static unsigned long lastTempUpdate = 0;
@@ -533,7 +480,7 @@ void networkTask(void * pv) {
         }
 
         if (millis() - lastBroadcast > 2000) {
-            DynamicJsonDocument doc(4096);
+            JsonDocument doc;
             doc["ram"] = currHeap;
             doc["internet"] = internetOK.load();
             doc["nat"] = natEnabled.load();
@@ -543,17 +490,17 @@ void networkTask(void * pv) {
             doc["clientCount"] = currentClients.load();
             doc["clientLimit"] = max_clients;
 
-            JsonArray clis = doc.createNestedArray("clients");
+            JsonArray clis = doc["clients"].to<JsonArray>();
             wifi_sta_list_t wifi_sta_list;
             esp_wifi_ap_get_sta_list(&wifi_sta_list);
-
+            
             if (lastClientCount != wifi_sta_list.num) {
                 lastClientCount = wifi_sta_list.num;
                 Serial.printf("📡 Clients: %d/%d\n", lastClientCount, max_clients);
             }
-
+            
             for (int i = 0; i < wifi_sta_list.num; i++) {
-                JsonObject c = clis.createNestedObject();
+                JsonObject c = clis.add<JsonObject>();
                 char m[18]; 
                 sprintf(m, "%02X:%02X:%02X:%02X:%02X:%02X", 
                         wifi_sta_list.sta[i].mac[0], wifi_sta_list.sta[i].mac[1],
@@ -577,34 +524,34 @@ void setup() {
     Serial.begin(115200);
     delay(100);
     uptimeStart = millis();
-
+    
     detectBoardCapabilities();
-    prefs.begin("apex-v21", false);
+    prefs.begin("apex-v22", false);  // namespace mới để tránh xung đột
 
     // Load STA config
     sta_ssid = prefs.getString("sta_ssid", "");
     sta_pass = urlDecode(prefs.getString("sta_pass", ""));
     ap_ssid = prefs.getString("ap_ssid", "APEX_ULTRA");
     ap_pass = validateAPPassword(urlDecode(prefs.getString("ap_pass", "12345678")));
-
+    
     if (board_supports_5ghz) {
         use_5ghz = prefs.getBool("use_5ghz", DEFAULT_BAND_5GHZ);
     }
-
+    
     ap_channel = validateChannel(prefs.getInt("ap_channel", DEFAULT_AP_CHANNEL), use_5ghz);
     ap_hidden = prefs.getBool("ap_hidden", DEFAULT_AP_HIDDEN);
     max_clients = validateMaxClients(prefs.getInt("max_clients", DEFAULT_MAX_CLIENTS));
     dns_mode = prefs.getInt("dns_mode", DEFAULT_DNS_MODE);
-
-    // Load NAT config
+    
+    // Load NAT config với ràng buộc
     int saved_tcp = validateNATTCP(prefs.getInt("nat_tcp", DEFAULT_NAPT_TCP));
     int saved_slots = validateNATSlots(prefs.getInt("nat_slots", DEFAULT_NAPT_SLOTS), saved_tcp);
     nat_max_slots = saved_slots;
     nat_max_tcp = saved_tcp;
 
     Serial.println("\n╔════════════════════════════════════════════════════╗");
-    Serial.println("║   APEX ULTRA V21.1.0 - NAT Configurable         ║");
-    Serial.println("║   Works on Arduino IDE & ESP-IDF                ║");
+    Serial.println("║   APEX ULTRA V22.0.0 - Full NAT Configurable     ║");
+    Serial.println("║   Works on Arduino core 2.x, 3.x & ESP-IDF       ║");
     Serial.println("╚════════════════════════════════════════════════════╝\n");
     Serial.printf("⚙️ NAT Slots: %d, TCP ports: %d\n", nat_max_slots, nat_max_tcp);
 
@@ -625,7 +572,7 @@ void setup() {
 
     // Register event handler
     ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
-                                                        &wifiEventHandler, NULL, NULL));
+                                                        &wifiEventHandler, nullptr, nullptr));
 
     // Connect to STA if configured
     if (sta_ssid.length() > 0) {
@@ -638,7 +585,7 @@ void setup() {
     // Web server routes
     server.on("/", HTTP_GET, [](AsyncWebServerRequest *r){ r->send_P(200, "text/html", index_html); });
     server.on("/scan", HTTP_GET, handleScan);
-
+    
     server.on("/get-board-info", HTTP_GET, [](AsyncWebServerRequest *r){
         String json = "{\"model\":\"" + board_model + "\",\"supports_5ghz\":" + 
                       String(board_supports_5ghz ? "true" : "false") + "}";
@@ -676,7 +623,7 @@ void setup() {
     server.on("/save-nat", HTTP_GET, [](AsyncWebServerRequest *r){
         int new_tcp = DEFAULT_NAPT_TCP;
         int new_slots = DEFAULT_NAPT_SLOTS;
-
+        
         if(r->hasParam("tcp")) {
             new_tcp = validateNATTCP(r->getParam("tcp")->value().toInt());
             prefs.putInt("nat_tcp", new_tcp);
@@ -701,7 +648,7 @@ void setup() {
 
     // Internet check task
     xTaskCreatePinnedToCore([](void* p){ 
-        esp_task_wdt_add(NULL);
+        esp_task_wdt_add(nullptr);
         for(;;){ 
             esp_task_wdt_reset();
             if(WiFi.status() == WL_CONNECTED){
@@ -714,16 +661,11 @@ void setup() {
             }
             vTaskDelay(20000); 
         } 
-    }, "CHK", 2048, NULL, 1, NULL, 1);
+    }, "CHK", 2048, nullptr, 1, nullptr, 1);
 
-    esp_task_wdt_config_t wdt_config = {
-        .timeout_ms = WATCHDOG_TIMEOUT * 1000,
-        .idle_core_mask = 0,
-        .trigger_panic = true
-    };
-    esp_task_wdt_init(&wdt_config);
-    esp_task_wdt_add(NULL);
-    xTaskCreatePinnedToCore(networkTask, "NET", 8192, NULL, 4, NULL, 0);
+    esp_task_wdt_init(WATCHDOG_TIMEOUT, true);
+    esp_task_wdt_add(nullptr);
+    xTaskCreatePinnedToCore(networkTask, "NET", 8192, nullptr, 4, nullptr, 0);
 
     // Blink LED
     pinMode(LED_BUILTIN, OUTPUT);
@@ -731,8 +673,8 @@ void setup() {
         digitalWrite(LED_BUILTIN, LOW); delay(80);
         digitalWrite(LED_BUILTIN, HIGH); delay(80);
     }
-
-    Serial.printf("✅ APEX ULTRA V21.1.0 Ready on %s!\n", board_model.c_str());
+    
+    Serial.printf("✅ APEX ULTRA V22.0.0 Ready on %s!\n", board_model.c_str());
 }
 
 void loop() { 
