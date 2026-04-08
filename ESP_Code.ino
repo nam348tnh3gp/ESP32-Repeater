@@ -1,9 +1,8 @@
 /*
-   ESP32 NAT ROUTER - V22.0.0 (Fully Configurable NAT on All Platforms)
-   - Cấu hình MAX_NAPT_SLOTS và MAX_NAPT_TCP thực sự hoạt động trên core 3.x
-   - Ràng buộc: slots >= TCP ports
-   - Cảnh báo RAM khi cấu hình quá lớn
-   - Tương thích Arduino core 2.x, 3.x và ESP-IDF
+   ESP32 NAT ROUTER - V22.0.1 (No napt.h dependency)
+   - Không cần #include <lwip/napt.h>
+   - Tự khai báo hàm lwIP NAT
+   - Tương thích Arduino core 2.x, 3.x, ESP-IDF
 */
 
 #include <Arduino.h>
@@ -18,11 +17,21 @@
 #include <esp_chip_info.h>
 #include <atomic>
 
-// ================= LUÔN INCLUDE LWIP NAT HEADERS (CHO MỌI NỀN TẢNG) =================
-#include <lwip/napt.h>
+// ================= LUÔN INCLUDE CÁC HEADER LWIP CẦN THIẾT =================
 #include <lwip/netif.h>
 #include <lwip/priv/tcpip_priv.h>
 #include <lwip/etharp.h>
+
+// ================= TỰ KHAI BÁO CÁC HÀM NAT (không cần napt.h) =================
+#ifdef __cplusplus
+extern "C" {
+#endif
+void ip_napt_init(uint16_t max_slots, uint16_t max_tcp_ports);
+err_t ip_napt_enable(ip4_addr_t addr, int dir);
+void ip_napt_disable(void);
+#ifdef __cplusplus
+}
+#endif
 
 // ================= TEMPERATURE SENSOR =================
 #ifndef CONFIG_IDF_TARGET_ESP32C5
@@ -99,7 +108,7 @@ int nat_max_tcp   = DEFAULT_NAPT_TCP;
 bool board_supports_5ghz = false;
 String board_model = "Unknown";
 
-// ================= NAT FUNCTIONS (lwIP native, hoạt động trên mọi nền tảng) =================
+// ================= NAT FUNCTIONS (dùng lwIP native, không cần header) =================
 void enableNAT() {
     if (WiFi.status() == WL_CONNECTED && !natEnabled.load()) {
         sys_lock_tcpip_core();
@@ -293,7 +302,7 @@ String getIPFromMAC(uint8_t* mac) {
 // ================= HTML UI (giữ nguyên, chỉ sửa tiêu đề phiên bản) =================
 const char index_html[] PROGMEM = R"rawliteral(
 <!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1'>
-<title>APEX ULTRA V22.0.0</title>
+<title>APEX ULTRA V22.0.1</title>
 <style>
 *{box-sizing:border-box;}
 body{font-family:Arial,sans-serif;background:#020617;color:#f8fafc;padding:15px;margin:0;}
@@ -305,7 +314,7 @@ button{width:100%;padding:14px;background:#38bdf8;color:#020617;border:none;bord
 .warning{color:#f59e0b;}
 </style></head><body>
 <div class='card'>
-  <h3>🛡️ APEX ULTRA V22.0.0 (NAT Configurable - Full Fix)</h3>
+  <h3>🛡️ APEX ULTRA V22.0.1 (NAT Configurable - No Header Deps)</h3>
   <div id='boardInfo'></div>
   <div>📊 RAM: <b id='ram'>0</b> KB</div>
   <div>🌡️ Temp: <b id='temp'>--</b> °C</div>
@@ -526,7 +535,7 @@ void setup() {
     uptimeStart = millis();
     
     detectBoardCapabilities();
-    prefs.begin("apex-v22", false);  // namespace mới để tránh xung đột
+    prefs.begin("apex-v22", false);
 
     // Load STA config
     sta_ssid = prefs.getString("sta_ssid", "");
@@ -550,7 +559,7 @@ void setup() {
     nat_max_tcp = saved_tcp;
 
     Serial.println("\n╔════════════════════════════════════════════════════╗");
-    Serial.println("║   APEX ULTRA V22.0.0 - Full NAT Configurable     ║");
+    Serial.println("║   APEX ULTRA V22.0.1 - No napt.h Dependency      ║");
     Serial.println("║   Works on Arduino core 2.x, 3.x & ESP-IDF       ║");
     Serial.println("╚════════════════════════════════════════════════════╝\n");
     Serial.printf("⚙️ NAT Slots: %d, TCP ports: %d\n", nat_max_slots, nat_max_tcp);
@@ -674,7 +683,7 @@ void setup() {
         digitalWrite(LED_BUILTIN, HIGH); delay(80);
     }
     
-    Serial.printf("✅ APEX ULTRA V22.0.0 Ready on %s!\n", board_model.c_str());
+    Serial.printf("✅ APEX ULTRA V22.0.1 Ready on %s!\n", board_model.c_str());
 }
 
 void loop() { 
