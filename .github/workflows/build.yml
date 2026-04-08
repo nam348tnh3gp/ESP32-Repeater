@@ -10,7 +10,9 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     strategy:
+      max-parallel: 1
       matrix:
         board: [esp32-s3, esp32-c5]
 
@@ -33,4 +35,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: firmware-${{ matrix.board }}
-          path: .pio/build/${{ matrix.board }}/*.bin
+          path: .pio/build/${{ matrix.board }}/*.binp
