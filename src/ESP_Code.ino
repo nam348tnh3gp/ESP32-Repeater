@@ -1,6 +1,7 @@
 /*
    ESP32 NAT ROUTER - V21.1.0 (Configurable NAT + RAM Warning)
    - Đã sửa lỗi tương thích Arduino core 3.x cho ESP32-C5
+   - Đã sửa lỗi include esp_temp_sensor.h
 */
 
 #include <Arduino.h>
@@ -37,7 +38,7 @@
 
 // ================= TEMPERATURE SENSOR =================
 #ifndef CONFIG_IDF_TARGET_ESP32C5
-#include <esp_temp_sensor.h>
+#include <driver/temp_sensor.h>  // SỬA: dùng driver/temp_sensor.h thay vì esp_temp_sensor.h
 #endif
 
 // ================= BOARD DETECTION =================
@@ -259,8 +260,8 @@ float getTemperature() {
     return 0.0f;
 #else
     float temp;
-    if (temp_sensor_read_celsius(&temp) == ESP_OK) return temp;
-    return 0.0f;
+    temp_sensor_read_celsius(&temp);
+    return temp;
 #endif
 }
 
@@ -480,13 +481,12 @@ void handleScan(AsyncWebServerRequest *r) {
         return;
     }
 
-    // Sửa: Dùng DynamicJsonDocument
     DynamicJsonDocument doc(2048);
     JsonArray array = doc.to<JsonArray>();
     int limit = min(n, MAX_SCAN_NETWORKS);
 
     for (int i = 0; i < limit; i++) {
-        JsonObject item = array.createNestedObject();  // Sửa: createNestedObject()
+        JsonObject item = array.createNestedObject();
         item["ssid"] = WiFi.SSID(i);
         item["rssi"] = WiFi.RSSI(i);
     }
@@ -533,7 +533,6 @@ void networkTask(void * pv) {
         }
 
         if (millis() - lastBroadcast > 2000) {
-            // Sửa: Dùng DynamicJsonDocument
             DynamicJsonDocument doc(4096);
             doc["ram"] = currHeap;
             doc["internet"] = internetOK.load();
@@ -544,7 +543,7 @@ void networkTask(void * pv) {
             doc["clientCount"] = currentClients.load();
             doc["clientLimit"] = max_clients;
 
-            JsonArray clis = doc.createNestedArray("clients");  // Sửa: createNestedArray()
+            JsonArray clis = doc.createNestedArray("clients");
             wifi_sta_list_t wifi_sta_list;
             esp_wifi_ap_get_sta_list(&wifi_sta_list);
 
@@ -554,7 +553,7 @@ void networkTask(void * pv) {
             }
 
             for (int i = 0; i < wifi_sta_list.num; i++) {
-                JsonObject c = clis.createNestedObject();  // Sửa: createNestedObject()
+                JsonObject c = clis.createNestedObject();
                 char m[18]; 
                 sprintf(m, "%02X:%02X:%02X:%02X:%02X:%02X", 
                         wifi_sta_list.sta[i].mac[0], wifi_sta_list.sta[i].mac[1],
@@ -717,7 +716,6 @@ void setup() {
         } 
     }, "CHK", 2048, NULL, 1, NULL, 1);
 
-    // Sửa: WDT init cho core 3.x
     esp_task_wdt_config_t wdt_config = {
         .timeout_ms = WATCHDOG_TIMEOUT * 1000,
         .idle_core_mask = 0,
