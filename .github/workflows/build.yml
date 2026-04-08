@@ -33,4 +33,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: firmware-${{ matrix.board }}
-          path: .pio/build/${{ matrix.board }}/firmware.bin
+          path: .pio/build/${{ matrix.board }}/*.bin
