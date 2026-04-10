@@ -1,6 +1,6 @@
 // ============================================================================
-// APEX ULTRA V22.0.1 - FULL STANDALONE .INO
-// Hoạt động độc lập, không cần file header hay thư viện ngoài
+// APEX ULTRA V22.0.1 - DUAL FRAMEWORK (Arduino + ESP-IDF Compatible)
+// Hoạt động trên cả Arduino framework và ESP-IDF framework
 // ============================================================================
 
 #include <Arduino.h>
@@ -29,9 +29,19 @@ void ip_napt_disable(void);
 }
 #endif
 
-// ================= TEMPERATURE =================
-#ifndef CONFIG_IDF_TARGET_ESP32C5
-#include <esp_temp_sensor.h>
+// ================= TEMPERATURE - DUAL FRAMEWORK COMPATIBLE =================
+// Arduino framework dùng temperatureRead(), ESP-IDF dùng esp_temp_sensor.h
+#if defined(CONFIG_IDF_TARGET_ESP32C5)
+    // ESP32-C5 không có cảm biến nhiệt
+    #define TEMP_SENSOR_AVAILABLE 0
+#elif defined(ARDUINO_ARCH_ESP32)
+    // Arduino framework
+    #define TEMP_SENSOR_AVAILABLE 1
+    // temperatureRead() có sẵn trong Arduino ESP32 core
+#else
+    // ESP-IDF framework (không phải Arduino)
+    #define TEMP_SENSOR_AVAILABLE 2
+    #include <esp_temp_sensor.h>
 #endif
 
 // ================= GLOBALS =================
@@ -136,14 +146,45 @@ int validateNATTCP(int tcp) {
     return tcp;
 }
 
-// ================= TEMPERATURE =================
+// ================= TEMPERATURE - DUAL FRAMEWORK IMPLEMENTATION =================
 float getTemperature() {
-#ifdef CONFIG_IDF_TARGET_ESP32C5
+#if TEMP_SENSOR_AVAILABLE == 0
+    // ESP32-C5 không có cảm biến
     return 0.0f;
-#else
+    
+#elif TEMP_SENSOR_AVAILABLE == 1
+    // Arduino framework - dùng temperatureRead()
+    // temperatureRead() trả về nhiệt độ theo độ C
+    float temp = temperatureRead();
+    return (temp > 0 && temp < 100) ? temp : 0.0f;
+    
+#elif TEMP_SENSOR_AVAILABLE == 2
+    // ESP-IDF framework
     float temp;
-    if (temp_sensor_read_celsius(&temp) == ESP_OK) return temp;
+    if (temp_sensor_read_celsius(&temp) == ESP_OK) {
+        return temp;
+    }
     return 0.0f;
+    
+#else
+    return 0.0f;
+#endif
+}
+
+// ================= TEMPERATURE SENSOR INIT - DUAL FRAMEWORK =================
+void initTemperatureSensor() {
+#if TEMP_SENSOR_AVAILABLE == 2
+    // ESP-IDF framework - cần khởi tạo sensor
+    temp_sensor_config_t temp_sensor = TSENS_CONFIG_DEFAULT();
+    temp_sensor.dac_offset = TSENS_DAC_L2;
+    temp_sensor_set_config(temp_sensor);
+    temp_sensor_start();
+    Serial.println("Temperature sensor initialized (ESP-IDF)");
+#elif TEMP_SENSOR_AVAILABLE == 1
+    // Arduino framework - không cần khởi tạo riêng
+    Serial.println("Temperature sensor ready (Arduino)");
+#else
+    Serial.println("Temperature sensor not available");
 #endif
 }
 
@@ -429,7 +470,7 @@ void setup() {
     uptimeStart = millis();
     
     Serial.println("\n==========================================");
-    Serial.println("APEX ULTRA V22.0.1 - STANDALONE");
+    Serial.println("APEX ULTRA V22.0.1 - DUAL FRAMEWORK");
     Serial.println("==========================================\n");
     
     // Init NVS
@@ -454,13 +495,8 @@ void setup() {
     
     Serial.printf("NAT: slots=%d, tcp=%d\n", nat_max_slots, nat_max_tcp);
     
-    // Temperature sensor
-#ifndef CONFIG_IDF_TARGET_ESP32C5
-    temp_sensor_config_t temp_sensor = TSENS_CONFIG_DEFAULT();
-    temp_sensor.dac_offset = TSENS_DAC_L2;
-    temp_sensor_set_config(temp_sensor);
-    temp_sensor_start();
-#endif
+    // Init temperature sensor (dual framework compatible)
+    initTemperatureSensor();
     
     // Setup WiFi AP
     WiFi.mode(WIFI_AP_STA);
