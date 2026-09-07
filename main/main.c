@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <ctype.h>
 #include <time.h>
+#include <strings.h>   // strncasecmp
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -17,6 +18,7 @@
 #include "esp_chip_info.h"
 #include "esp_random.h"
 #include "esp_timer.h"
+#include "esp_http_client.h"
 #include "nvs_flash.h"
 #include "esp_task_wdt.h"
 #include "driver/gpio.h"
@@ -30,7 +32,7 @@
 #include "lwip/dns.h"
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
-#include "lwip/inet.h"   // <-- thêm để dùng inet_addr()
+#include "lwip/inet.h"
 
 #include "esp_http_server.h"
 #include "cJSON.h"
@@ -66,8 +68,9 @@
 static const char *TAG = "APEX_ROUTER";
 
 static EventGroupHandle_t wifi_event_group;
-static int s_retry_num = 0;
+static int s_retry_num = 0;                  // protected by sta_state_mutex
 static bool sta_configured = false;
+static bool sta_disconnected = true;         // protected by sta_state_mutex
 
 static httpd_handle_t server = NULL;
 
@@ -75,6 +78,7 @@ static SemaphoreHandle_t state_mutex;
 static bool nat_enabled = false;
 static esp_netif_t *s_ap_netif = NULL;
 static bool internet_ok = false;
+static bool internet_reachable = false;
 static int current_clients = 0;
 static int last_rssi = -100;
 
@@ -91,13 +95,25 @@ static int32_t nat_tcp = NAT_MAX_TCP;
 static nvs_handle_t s_nvs_handle;
 
 static SemaphoreHandle_t nvs_mutex;
+static SemaphoreHandle_t rate_limit_mutex;
+static SemaphoreHandle_t sta_state_mutex;  // Bảo vệ sta_disconnected, s_retry_num
 static char session_token[24] = {0};
 static unsigned long last_config_window_ms = 0;
-static int config_request_count = 0;
+static int config_request_count = 0;       // protected by rate_limit_mutex
 
 // ================= CAPTIVE PORTAL FIX =================
-static int dns_socket = -1;          // (không bắt buộc dùng)
-static TaskHandle_t dns_task_handle = NULL;
+static const char* captive_domains[] = {
+    "connectivitycheck.gstatic.com",
+    "connectivitycheck.android.com",
+    "detectportal.firefox.com",
+    "www.msftncsi.com",
+    "captive.apple.com",
+    "www.apple.com",
+    "clients3.google.com",
+    "nmcheck.gnome.org",
+    "www.google.com",
+    NULL
+};
 
 // HTML trang chủ (giữ nguyên)
 static const char *index_html_tmpl =
@@ -215,20 +231,46 @@ static bool is_internet_available(void) {
     return ok;
 }
 
+static bool perform_internet_check(void) {
+    esp_http_client_config_t config = {
+        .url = "http://connectivitycheck.gstatic.com/generate_204",
+        .timeout_ms = 5000,
+        .method = HTTP_METHOD_GET,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (client == NULL) return false;
+
+    esp_err_t err = esp_http_client_perform(client);
+    int status_code = esp_http_client_get_status_code(client);
+    esp_http_client_cleanup(client);
+
+    return (err == ESP_OK) && (status_code == 204 || status_code == 200);
+}
+
 // ================= CAPTIVE PORTAL DNS SERVER =================
+static bool ends_with_domain(const char *qname, const char *domain) {
+    size_t qname_len = strlen(qname);
+    size_t domain_len = strlen(domain);
+    if (qname_len < domain_len) return false;
+
+    if (qname_len > 0 && qname[qname_len-1] == '.') qname_len--;
+
+    if (qname_len < domain_len) return false;
+    const char *qname_end = qname + (qname_len - domain_len);
+    return strncasecmp(qname_end, domain, domain_len) == 0;
+}
+
 static void dns_captive_task(void *pv) {
     struct sockaddr_in server_addr, client_addr;
     socklen_t addr_len = sizeof(client_addr);
     uint8_t buffer[512];
 
-    // Tạo socket UDP
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (sock < 0) {
         ESP_LOGE(TAG, "DNS: Failed to create socket");
         return;
     }
 
-    // Bind tới port 53 (DNS)
     server_addr.sin_family = AF_INET;
     server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
     server_addr.sin_port = htons(53);
@@ -245,88 +287,169 @@ static void dns_captive_task(void *pv) {
         int len = recvfrom(sock, buffer, sizeof(buffer), 0,
                           (struct sockaddr *)&client_addr, &addr_len);
         if (len > 0) {
+            if (len < 12) continue;
+
             bool internet = is_internet_available();
 
             if (internet) {
-                // Forward DNS query tới DNS upstream (8.8.8.8)
+                // Forward DNS query tới upstream (8.8.8.8)
                 int upstream_sock = socket(AF_INET, SOCK_DGRAM, 0);
-                if (upstream_sock >= 0) {
+                if (upstream_sock < 0) {
+                    // Không tạo được socket, gửi SERVFAIL
+                    ESP_LOGE(TAG, "DNS: Failed to create upstream socket");
+                    uint8_t resp[512];
+                    memcpy(resp, buffer, len);
+                    resp[2] = 0x81;  // QR=1, RD=1
+                    resp[3] = 0x80;  // RA=1, RCODE=2 (SERVFAIL)
+                    memset(resp + 4, 0, 8);
+                    sendto(sock, resp, len, 0,
+                           (struct sockaddr *)&client_addr, addr_len);
+                } else {
                     struct sockaddr_in upstream_addr;
                     upstream_addr.sin_family = AF_INET;
                     upstream_addr.sin_port = htons(53);
                     upstream_addr.sin_addr.s_addr = inet_addr("8.8.8.8");
 
-                    sendto(upstream_sock, buffer, len, 0,
-                           (struct sockaddr *)&upstream_addr, sizeof(upstream_addr));
+                    int sent = sendto(upstream_sock, buffer, len, 0,
+                                      (struct sockaddr *)&upstream_addr, sizeof(upstream_addr));
+                    if (sent >= 0) {
+                        struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
+                        setsockopt(upstream_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-                    // Timeout 1 giây để nhận phản hồi
-                    struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
-                    setsockopt(upstream_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
-                    uint8_t upstream_resp[512];
-                    int up_len = recv(upstream_sock, upstream_resp, sizeof(upstream_resp), 0);
-                    if (up_len > 0) {
-                        // Gửi lại phản hồi cho client
-                        sendto(sock, upstream_resp, up_len, 0,
+                        uint8_t upstream_resp[512];
+                        int up_len = recv(upstream_sock, upstream_resp, sizeof(upstream_resp), 0);
+                        if (up_len > 0) {
+                            sendto(sock, upstream_resp, up_len, 0,
+                                   (struct sockaddr *)&client_addr, addr_len);
+                        } else {
+                            // Không nhận được phản hồi -> gửi SERVFAIL
+                            uint8_t resp[512];
+                            memcpy(resp, buffer, len);
+                            resp[2] = 0x81;
+                            resp[3] = 0x80;
+                            memset(resp + 4, 0, 8);
+                            sendto(sock, resp, len, 0,
+                                   (struct sockaddr *)&client_addr, addr_len);
+                        }
+                    } else {
+                        ESP_LOGW(TAG, "DNS: sendto upstream failed");
+                        uint8_t resp[512];
+                        memcpy(resp, buffer, len);
+                        resp[2] = 0x81;
+                        resp[3] = 0x80;
+                        memset(resp + 4, 0, 8);
+                        sendto(sock, resp, len, 0,
                                (struct sockaddr *)&client_addr, addr_len);
                     }
                     close(upstream_sock);
                 }
             } else {
-                // Xây dựng DNS response giả trả IP AP (192.168.4.1)
-                uint8_t response[512];
-                memset(response, 0, sizeof(response));
-
-                int resp_len = len;
-                memcpy(response, buffer, len);
-
-                response[2] = 0x85;  // QR=1, AA=1
-                response[3] = 0x80;  // RA=1
-                response[6] = 0x00;
-                response[7] = 0x01;  // Answer count = 1
-
-                // Tìm vị trí bắt đầu của QNAME
-                int qname_start = 12;
+                // Chưa có Internet: chỉ giả mạo cho domain captive detection
+                // Parse QNAME an toàn
+                char qname[256] = {0};
                 int qname_len = 0;
-                for (int i = qname_start; i < len; i++) {
-                    if (buffer[i] == 0) {
-                        qname_len = i - qname_start;
+                int pos = 12;
+                bool parse_ok = true;
+                bool compressed = false;
+                while (pos < len && buffer[pos] != 0) {
+                    uint8_t label_len = buffer[pos];
+                    if ((label_len & 0xC0) == 0xC0) {
+                        compressed = true;
+                        break;
+                    }
+                    pos++;
+                    if (pos + label_len > len) {
+                        parse_ok = false;
+                        break;
+                    }
+                    for (int i = 0; i < label_len; i++) {
+                        if (qname_len < sizeof(qname) - 1) {
+                            qname[qname_len++] = buffer[pos++];
+                        } else {
+                            parse_ok = false;
+                            break;
+                        }
+                    }
+                    if (!parse_ok) break;
+                    if (qname_len < sizeof(qname) - 1) {
+                        qname[qname_len++] = '.';
+                    }
+                }
+                if (!parse_ok || compressed || qname_len == 0) {
+                    continue;
+                }
+                qname[qname_len] = '\0';
+
+                bool is_captive_domain = false;
+                for (int i = 0; captive_domains[i] != NULL; i++) {
+                    if (ends_with_domain(qname, captive_domains[i])) {
+                        is_captive_domain = true;
                         break;
                     }
                 }
 
-                int off = qname_start + qname_len + 1;
-                response[off++] = 0xC0;
-                response[off++] = 0x0C;
+                if (is_captive_domain) {
+                    uint8_t response[512];
+                    memcpy(response, buffer, len);
+                    response[2] = 0x85;  // QR=1, AA=1
+                    response[3] = 0x80;  // RA=1
+                    memset(response + 4, 0, 8);
+                    response[6] = 0x00;
+                    response[7] = 0x01;  // ANCOUNT = 1
 
-                // Type A (1)
-                response[off++] = 0x00;
-                response[off++] = 0x01;
+                    int qname_start = 12;
+                    int qname_end = qname_start;
+                    bool qname_has_compression = false;
+                    while (qname_end < len && buffer[qname_end] != 0) {
+                        uint8_t label_len = buffer[qname_end];
+                        if ((label_len & 0xC0) == 0xC0) {
+                            qname_has_compression = true;
+                            break;
+                        }
+                        if (qname_end + 1 + label_len > len) {
+                            break;
+                        }
+                        qname_end += 1 + label_len;
+                    }
+                    if (qname_has_compression || qname_end >= len || buffer[qname_end] != 0) {
+                        continue; // Bỏ qua gói tin nếu có nén hoặc không tìm thấy byte kết thúc
+                    }
 
-                // Class IN (1)
-                response[off++] = 0x00;
-                response[off++] = 0x01;
+                    int off = qname_end + 1 + 4;  // sau QNAME + QTYPE + QCLASS
+                    if (off > len) {
+                        // Question không đầy đủ, bỏ qua
+                        continue;
+                    }
+                    if (off + 16 > (int)sizeof(response)) continue;
 
-                // TTL (60 seconds)
-                response[off++] = 0x00;
-                response[off++] = 0x00;
-                response[off++] = 0x00;
-                response[off++] = 0x3C;
+                    response[off++] = 0xC0;
+                    response[off++] = 0x0C;
+                    response[off++] = 0x00;
+                    response[off++] = 0x01;  // Type A
+                    response[off++] = 0x00;
+                    response[off++] = 0x01;  // Class IN
+                    response[off++] = 0x00;
+                    response[off++] = 0x00;
+                    response[off++] = 0x00;
+                    response[off++] = 0x3C;  // TTL
+                    response[off++] = 0x00;
+                    response[off++] = 0x04;
+                    response[off++] = 192;
+                    response[off++] = 168;
+                    response[off++] = 4;
+                    response[off++] = 1;
 
-                // Data length: 4 bytes
-                response[off++] = 0x00;
-                response[off++] = 0x04;
-
-                // IP: 192.168.4.1
-                response[off++] = 192;
-                response[off++] = 168;
-                response[off++] = 4;
-                response[off++] = 1;
-
-                resp_len = off;
-
-                sendto(sock, response, resp_len, 0,
-                       (struct sockaddr *)&client_addr, addr_len);
+                    sendto(sock, response, off, 0,
+                           (struct sockaddr *)&client_addr, addr_len);
+                } else {
+                    uint8_t resp[512];
+                    memcpy(resp, buffer, len);
+                    resp[2] = 0x81;
+                    resp[3] = 0x83;
+                    memset(resp + 4, 0, 8);
+                    sendto(sock, resp, len, 0,
+                           (struct sockaddr *)&client_addr, addr_len);
+                }
             }
         }
         vTaskDelay(pdMS_TO_TICKS(1));
@@ -337,12 +460,11 @@ static void dns_captive_task(void *pv) {
 // ================= CAPTIVE PORTAL HTTP HANDLERS =================
 static esp_err_t captive_204_handler(httpd_req_t *req) {
     if (is_internet_available()) {
-        // Khi có Internet thật, trả 404 để tránh bị coi là captive portal
-        httpd_resp_set_status(req, "404 Not Found");
+        httpd_resp_set_status(req, "204 No Content");
         httpd_resp_send(req, NULL, 0);
     } else {
-        // Khi chưa có Internet, giữ captive portal
-        httpd_resp_set_status(req, "204 No Content");
+        httpd_resp_set_status(req, "302 Found");
+        httpd_resp_set_hdr(req, "Location", "http://192.168.4.1/");
         httpd_resp_send(req, NULL, 0);
     }
     return ESP_OK;
@@ -353,14 +475,9 @@ static esp_err_t captive_success_handler(httpd_req_t *req) {
         httpd_resp_set_status(req, "404 Not Found");
         httpd_resp_send(req, NULL, 0);
     } else {
-        const char *html = "<!DOCTYPE html><html><head><meta charset='UTF-8'><title>Internet OK</title></head>"
-                           "<body style='font-family:Arial;text-align:center;padding:50px;'>"
-                           "<h1>✅ Internet Connection OK</h1>"
-                           "<p>You can now browse the internet.</p>"
-                           "<a href='http://192.168.4.1'>Go to Dashboard</a>"
-                           "</body></html>";
-        httpd_resp_set_type(req, "text/html");
-        httpd_resp_send(req, html, strlen(html));
+        httpd_resp_set_status(req, "302 Found");
+        httpd_resp_set_hdr(req, "Location", "http://192.168.4.1/");
+        httpd_resp_send(req, NULL, 0);
     }
     return ESP_OK;
 }
@@ -439,26 +556,27 @@ static void load_config(void) {
 }
 
 // ================= NAT FUNCTIONS =================
-static void enable_nat(void) {
+static bool enable_nat(void) {
     xSemaphoreTake(state_mutex, portMAX_DELAY);
     bool already = nat_enabled;
     xSemaphoreGive(state_mutex);
-    if (already) return;
+    if (already) return true;
 
     if (s_ap_netif == NULL) {
         ESP_LOGE(TAG, "enable_nat: AP netif chưa được khởi tạo");
-        return;
+        return false;
     }
     esp_err_t err = esp_netif_napt_enable(s_ap_netif);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_netif_napt_enable failed: %s", esp_err_to_name(err));
-        return;
+        return false;
     }
 
     xSemaphoreTake(state_mutex, portMAX_DELAY);
     nat_enabled = true;
     xSemaphoreGive(state_mutex);
     ESP_LOGI(TAG, "NAT enabled (slots=%d, tcp=%d)", (int)nat_slots, (int)nat_tcp);
+    return true;
 }
 
 static void disable_nat(void) {
@@ -486,9 +604,17 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         if (sta_configured) esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        bool should_retry = false;
+        xSemaphoreTake(sta_state_mutex, portMAX_DELAY);
+        sta_disconnected = true;
         if (s_retry_num < STA_MAX_RETRY) {
-            esp_wifi_connect();
             s_retry_num++;
+            should_retry = true;
+        }
+        xSemaphoreGive(sta_state_mutex);
+
+        if (should_retry) {
+            esp_wifi_connect();
             ESP_LOGI(TAG, "Retry connecting... (%d/%d)", s_retry_num, STA_MAX_RETRY);
         } else {
             xEventGroupSetBits(wifi_event_group, WIFI_FAIL_BIT);
@@ -496,6 +622,9 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
                      STA_RECONNECT_BACKOFF_MS / 1000);
         }
         disable_nat();
+        xSemaphoreTake(state_mutex, portMAX_DELAY);
+        internet_ok = false;
+        xSemaphoreGive(state_mutex);
         ESP_LOGI(TAG, "STA disconnected");
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_STACONNECTED) {
         xSemaphoreTake(state_mutex, portMAX_DELAY);
@@ -512,23 +641,41 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
+        xSemaphoreTake(sta_state_mutex, portMAX_DELAY);
         s_retry_num = 0;
+        sta_disconnected = false;
+        xSemaphoreGive(sta_state_mutex);
         xEventGroupClearBits(wifi_event_group, WIFI_FAIL_BIT);
         xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
-        enable_nat();
     }
 }
 
-// FIX #4: task nền định kỳ thử kết nối lại STA
+// ================= TASK NỀN KẾT NỐI LẠI STA =================
 static void sta_reconnect_task(void *pv) {
     esp_task_wdt_add(NULL);
     for (;;) {
         esp_task_wdt_reset();
         EventBits_t bits = xEventGroupGetBits(wifi_event_group);
-        if (sta_configured && !(bits & WIFI_CONNECTED_BIT)) {
+        bool should_connect = false;
+        xSemaphoreTake(sta_state_mutex, portMAX_DELAY);
+        if (sta_configured && !(bits & WIFI_CONNECTED_BIT) && sta_disconnected) {
+            should_connect = true;
+            // Đánh dấu là đang kết nối để tránh gọi lặp
+            sta_disconnected = false;
+            // Không đặt lại s_retry_num ở đây để giữ nguyên logic retry ban đầu
+            // s_retry_num = 0;
+        }
+        xSemaphoreGive(sta_state_mutex);
+
+        if (should_connect) {
             ESP_LOGI(TAG, "Background STA reconnect attempt...");
-            s_retry_num = 0;
-            esp_wifi_connect();
+            esp_err_t err = esp_wifi_connect();
+            if (err != ESP_OK) {
+                xSemaphoreTake(sta_state_mutex, portMAX_DELAY);
+                sta_disconnected = true;
+                xSemaphoreGive(sta_state_mutex);
+                ESP_LOGW(TAG, "esp_wifi_connect failed: %s", esp_err_to_name(err));
+            }
         }
         vTaskDelay(pdMS_TO_TICKS(STA_RECONNECT_BACKOFF_MS));
     }
@@ -631,13 +778,19 @@ static bool check_auth_and_rate(const char *body, httpd_req_t *req) {
         return false;
     }
 
+    xSemaphoreTake(rate_limit_mutex, portMAX_DELAY);
+
     unsigned long now = (unsigned long)(esp_timer_get_time() / 1000ULL);
     if (now - last_config_window_ms > CONFIG_RATE_WINDOW_MS) {
         last_config_window_ms = now;
         config_request_count = 0;
     }
     config_request_count++;
-    if (config_request_count > CONFIG_RATE_MAX_REQ) {
+    bool rate_ok = (config_request_count <= CONFIG_RATE_MAX_REQ);
+
+    xSemaphoreGive(rate_limit_mutex);
+
+    if (!rate_ok) {
         httpd_resp_set_status(req, "429 Too Many Requests");
         httpd_resp_send(req, "Too many requests, slow down", HTTPD_RESP_USE_STRLEN);
         return false;
@@ -712,10 +865,14 @@ static esp_err_t clients_get_handler(httpd_req_t *req) {
     }
     esp_netif_dhcps_get_clients_by_mac(s_ap_netif, num, pairs);
 
-    char buffer[10 * 48 + 4];
+    // Tăng buffer size an toàn
+    char buffer[1024];   // đủ lớn cho 10 client
     int off = 0;
     buffer[off++] = '[';
     for (int i = 0; i < num; i++) {
+        if (off + 80 >= sizeof(buffer)) {
+            break; // Đảm bảo không tràn
+        }
         off += snprintf(buffer + off, sizeof(buffer) - off,
             "%s{\"mac\":\"%02X:%02X:%02X:%02X:%02X:%02X\",\"ip\":\"" IPSTR "\"}",
             (i > 0) ? "," : "",
@@ -739,11 +896,22 @@ static esp_err_t save_sta_get_handler(httpd_req_t *req) {
     char pass[PASS_BUF_LEN] = {0};
     char value[QUERY_VALUE_LEN];
 
-    if (httpd_query_key_value(query, "ssid", value, sizeof(value)) == ESP_OK) {
+    esp_err_t res_ssid = httpd_query_key_value(query, "ssid", value, sizeof(value));
+    if (res_ssid == ESP_OK) {
         url_decode(ssid, sizeof(ssid), value);
+    } else if (res_ssid != ESP_ERR_NOT_FOUND) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_send(req, "ssid too long", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
     }
-    if (httpd_query_key_value(query, "pass", value, sizeof(value)) == ESP_OK) {
+
+    esp_err_t res_pass = httpd_query_key_value(query, "pass", value, sizeof(value));
+    if (res_pass == ESP_OK) {
         url_decode(pass, sizeof(pass), value);
+    } else if (res_pass != ESP_ERR_NOT_FOUND) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_send(req, "pass too long", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
     }
 
     if (strlen(ssid) > 0) {
@@ -757,7 +925,6 @@ static esp_err_t save_sta_get_handler(httpd_req_t *req) {
 
     httpd_resp_set_type(req, "text/plain");
     httpd_resp_send(req, "STA Saved. Rebooting...", HTTPD_RESP_USE_STRLEN);
-
     vTaskDelay(pdMS_TO_TICKS(1000));
     esp_restart();
     return ESP_OK;
@@ -772,20 +939,29 @@ static esp_err_t save_ap_get_handler(httpd_req_t *req) {
     char pass[PASS_BUF_LEN] = {0};
     char value[QUERY_VALUE_LEN];
 
-    if (httpd_query_key_value(query, "ssid", value, sizeof(value)) == ESP_OK) {
+    esp_err_t res_ssid = httpd_query_key_value(query, "ssid", value, sizeof(value));
+    if (res_ssid == ESP_OK) {
         url_decode(ssid, sizeof(ssid), value);
         if (strlen(ssid) > 0) strncpy(ap_ssid, ssid, sizeof(ap_ssid) - 1);
+    } else if (res_ssid != ESP_ERR_NOT_FOUND) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_send(req, "ssid too long", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
     }
-    if (httpd_query_key_value(query, "pass", value, sizeof(value)) == ESP_OK) {
+
+    esp_err_t res_pass = httpd_query_key_value(query, "pass", value, sizeof(value));
+    if (res_pass == ESP_OK) {
         url_decode(pass, sizeof(pass), value);
         if (strlen(pass) >= 8) strncpy(ap_pass, pass, sizeof(ap_pass) - 1);
+    } else if (res_pass != ESP_ERR_NOT_FOUND) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_send(req, "pass too long", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
     }
 
     save_config();
-
     httpd_resp_set_type(req, "text/plain");
     httpd_resp_send(req, "AP Saved. Rebooting...", HTTPD_RESP_USE_STRLEN);
-
     vTaskDelay(pdMS_TO_TICKS(1000));
     esp_restart();
     return ESP_OK;
@@ -797,22 +973,31 @@ static esp_err_t save_nat_get_handler(httpd_req_t *req) {
     if (!check_auth_and_rate(query, req)) return ESP_OK;
 
     char value[16];
-
-    if (httpd_query_key_value(query, "slots", value, sizeof(value)) == ESP_OK) {
+    esp_err_t res_slots = httpd_query_key_value(query, "slots", value, sizeof(value));
+    if (res_slots == ESP_OK) {
         int slots = atoi(value);
         if (slots >= 64 && slots <= 4096) nat_slots = slots;
+    } else if (res_slots != ESP_ERR_NOT_FOUND) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_send(req, "slots value too long", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
     }
-    if (httpd_query_key_value(query, "tcp", value, sizeof(value)) == ESP_OK) {
+
+    esp_err_t res_tcp = httpd_query_key_value(query, "tcp", value, sizeof(value));
+    if (res_tcp == ESP_OK) {
         int tcp = atoi(value);
         if (tcp >= 32 && tcp <= 2048) nat_tcp = tcp;
+    } else if (res_tcp != ESP_ERR_NOT_FOUND) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_send(req, "tcp value too long", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
     }
-    if (nat_slots < nat_tcp) nat_slots = nat_tcp;
 
+    if (nat_slots < nat_tcp) nat_slots = nat_tcp;
     save_config();
 
     httpd_resp_set_type(req, "text/plain");
     httpd_resp_send(req, "NAT Saved. Rebooting...", HTTPD_RESP_USE_STRLEN);
-
     vTaskDelay(pdMS_TO_TICKS(1000));
     esp_restart();
     return ESP_OK;
@@ -957,26 +1142,39 @@ static void internet_check_task(void *pv) {
     for (;;) {
         esp_task_wdt_reset();
 
-        EventBits_t bits = xEventGroupGetBits(wifi_event_group);
-        bool sta_connected = (bits & WIFI_CONNECTED_BIT) != 0;
+        bool sta_connected = (xEventGroupGetBits(wifi_event_group) & WIFI_CONNECTED_BIT) != 0;
 
-        xSemaphoreTake(state_mutex, portMAX_DELAY);
-        bool nat_e = nat_enabled;
-        xSemaphoreGive(state_mutex);
-
-        bool ok = sta_connected && nat_e;
-
-        xSemaphoreTake(state_mutex, portMAX_DELAY);
-        internet_ok = ok;
-        xSemaphoreGive(state_mutex);
-
-        if (ok) {
-            ESP_LOGI(TAG, "✅ Internet: ONLINE (STA connected + NAT enabled)");
+        if (sta_connected) {
+            internet_reachable = perform_internet_check();
         } else {
-            ESP_LOGI(TAG, "❌ Internet: OFFLINE (STA=%d, NAT=%d)", sta_connected, nat_e);
+            internet_reachable = false;
         }
 
-        vTaskDelay(pdMS_TO_TICKS(10000));
+        bool should_be_online = sta_connected && internet_reachable;
+
+        if (should_be_online) {
+            if (!nat_enabled) {
+                if (!enable_nat()) {
+                    should_be_online = false;
+                }
+            }
+        } else {
+            if (nat_enabled) {
+                disable_nat();
+            }
+        }
+
+        xSemaphoreTake(state_mutex, portMAX_DELAY);
+        internet_ok = should_be_online;
+        xSemaphoreGive(state_mutex);
+
+        if (should_be_online) {
+            ESP_LOGI(TAG, "✅ Internet: ONLINE");
+        } else {
+            ESP_LOGI(TAG, "❌ Internet: OFFLINE (STA=%d, Reachable=%d)", sta_connected, internet_reachable);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(60000));  // Kiểm tra mỗi 60 giây
     }
 }
 
@@ -987,7 +1185,25 @@ void app_main(void) {
     ESP_LOGI(TAG, "==========================================\n");
 
     state_mutex = xSemaphoreCreateMutex();
+    if (state_mutex == NULL) {
+        ESP_LOGE(TAG, "Failed to create state_mutex");
+        abort();
+    }
     nvs_mutex = xSemaphoreCreateMutex();
+    if (nvs_mutex == NULL) {
+        ESP_LOGE(TAG, "Failed to create nvs_mutex");
+        abort();
+    }
+    rate_limit_mutex = xSemaphoreCreateMutex();
+    if (rate_limit_mutex == NULL) {
+        ESP_LOGE(TAG, "Failed to create rate_limit_mutex");
+        abort();
+    }
+    sta_state_mutex = xSemaphoreCreateMutex();
+    if (sta_state_mutex == NULL) {
+        ESP_LOGE(TAG, "Failed to create sta_state_mutex");
+        abort();
+    }
 
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -1032,7 +1248,7 @@ void app_main(void) {
 
     start_webserver();
 
-    xTaskCreate(internet_check_task, "inet_check", 3072, NULL, 2, NULL);
+    xTaskCreate(internet_check_task, "inet_check", 4096, NULL, 2, NULL);
     xTaskCreate(sta_reconnect_task, "sta_reconnect", 3072, NULL, 2, NULL);
     xTaskCreate(dns_captive_task, "dns_captive", 4096, NULL, 5, NULL);
 
