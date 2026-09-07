@@ -28,6 +28,8 @@
 #include "lwip/priv/tcpip_priv.h"
 #include "lwip/etharp.h"
 #include "lwip/dns.h"
+#include "lwip/sockets.h"
+#include "lwip/netdb.h"
 
 #include "esp_http_server.h"
 #include "cJSON.h"
@@ -114,6 +116,11 @@ static SemaphoreHandle_t nvs_mutex;
 static char session_token[24] = {0};
 static unsigned long last_config_window_ms = 0;
 static int config_request_count = 0;
+
+// ================= CAPTIVE PORTAL FIX =================
+// DNS Socket cho captive portal
+static int dns_socket = -1;
+static TaskHandle_t dns_task_handle = NULL;
 
 // HTML trang chủ
 static const char *index_html_tmpl =
@@ -221,6 +228,121 @@ static const char *index_html_tmpl =
 "bindForm('apForm','apMsg',true);"
 "bindForm('natForm','natMsg',true);"
 "</script></body></html>";
+
+// ================= CAPTIVE PORTAL DNS SERVER =================
+static void dns_captive_task(void *pv) {
+    struct sockaddr_in server_addr, client_addr;
+    socklen_t addr_len = sizeof(client_addr);
+    uint8_t buffer[512];
+    
+    // Tạo socket UDP
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) {
+        ESP_LOGE(TAG, "DNS: Failed to create socket");
+        return;
+    }
+    
+    // Bind tới port 53 (DNS)
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    server_addr.sin_port = htons(53);
+    
+    if (bind(sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+        ESP_LOGE(TAG, "DNS: Failed to bind to port 53");
+        close(sock);
+        return;
+    }
+    
+    ESP_LOGI(TAG, "✅ DNS Captive Portal started on port 53");
+    
+    while (1) {
+        int len = recvfrom(sock, buffer, sizeof(buffer), 0, 
+                          (struct sockaddr *)&client_addr, &addr_len);
+        if (len > 0) {
+            // Xây dựng DNS response
+            uint8_t response[512];
+            memset(response, 0, sizeof(response));
+            
+            // Copy header + question
+            int resp_len = len;
+            memcpy(response, buffer, len);
+            
+            // Set flags: response + authoritative
+            response[2] = 0x85;  // QR=1, AA=1
+            response[3] = 0x80;  // RA=1
+            
+            // Answer count = 1
+            response[6] = 0x00;
+            response[7] = 0x01;
+            
+            // Tìm vị trí bắt đầu của QNAME
+            int qname_start = 12;
+            int qname_len = 0;
+            for (int i = qname_start; i < len; i++) {
+                if (buffer[i] == 0) {
+                    qname_len = i - qname_start;
+                    break;
+                }
+            }
+            
+            // Pointer to domain name (compressed)
+            int off = qname_start + qname_len + 1;
+            response[off++] = 0xC0;
+            response[off++] = 0x0C;
+            
+            // Type A (1)
+            response[off++] = 0x00;
+            response[off++] = 0x01;
+            
+            // Class IN (1)
+            response[off++] = 0x00;
+            response[off++] = 0x01;
+            
+            // TTL (60 seconds)
+            response[off++] = 0x00;
+            response[off++] = 0x00;
+            response[off++] = 0x00;
+            response[off++] = 0x3C;
+            
+            // Data length: 4 bytes (IPv4)
+            response[off++] = 0x00;
+            response[off++] = 0x04;
+            
+            // IP: 192.168.4.1 (AP IP)
+            response[off++] = 192;
+            response[off++] = 168;
+            response[off++] = 4;
+            response[off++] = 1;
+            
+            resp_len = off;
+            
+            // Gửi response
+            sendto(sock, response, resp_len, 0, 
+                   (struct sockaddr *)&client_addr, addr_len);
+        }
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    close(sock);
+}
+
+// ================= CAPTIVE PORTAL HTTP HANDLERS =================
+static esp_err_t captive_204_handler(httpd_req_t *req) {
+    httpd_resp_set_status(req, "204 No Content");
+    httpd_resp_send(req, NULL, 0);
+    return ESP_OK;
+}
+
+static esp_err_t captive_success_handler(httpd_req_t *req) {
+    const char *html = "<!DOCTYPE html><html><head><meta charset='UTF-8'><title>Internet OK</title></head>"
+                       "<body style='font-family:Arial;text-align:center;padding:50px;'>"
+                       "<h1>✅ Internet Connection OK</h1>"
+                       "<p>You can now browse the internet.</p>"
+                       "<a href='http://192.168.4.1'>Go to Dashboard</a>"
+                       "</body></html>";
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, html, strlen(html));
+    return ESP_OK;
+}
 
 // ================= UTILITY FUNCTIONS =================
 // FIX #1 (CRITICAL): url_decode giờ nhận thêm dst_size và KHÔNG BAO GIỜ ghi
@@ -759,12 +881,68 @@ static const httpd_uri_t save_nat_uri = {
     .handler = save_nat_get_handler,
 };
 
+// ================= CAPTIVE PORTAL URIS =================
+static const httpd_uri_t captive_204_uri = {
+    .uri = "/generate_204",
+    .method = HTTP_GET,
+    .handler = captive_204_handler,
+};
+
+static const httpd_uri_t captive_connectivity_uri = {
+    .uri = "/connectivity-check",
+    .method = HTTP_GET,
+    .handler = captive_204_handler,
+};
+
+static const httpd_uri_t captive_success_uri = {
+    .uri = "/success",
+    .method = HTTP_GET,
+    .handler = captive_success_handler,
+};
+
+static const httpd_uri_t captive_apple_uri = {
+    .uri = "/captive",
+    .method = HTTP_GET,
+    .handler = captive_204_handler,
+};
+
+static const httpd_uri_t captive_hotspot_uri = {
+    .uri = "/hotspot-detect.html",
+    .method = HTTP_GET,
+    .handler = captive_204_handler,
+};
+
+static const httpd_uri_t captive_library_uri = {
+    .uri = "/library/test/success.html",
+    .method = HTTP_GET,
+    .handler = captive_204_handler,
+};
+
+static const httpd_uri_t captive_ncsi_uri = {
+    .uri = "/ncsi.txt",
+    .method = HTTP_GET,
+    .handler = captive_204_handler,
+};
+
+static const httpd_uri_t captive_canonical_uri = {
+    .uri = "/canonical.html",
+    .method = HTTP_GET,
+    .handler = captive_204_handler,
+};
+
+static const httpd_uri_t captive_apple_site_uri = {
+    .uri = "/apple-sd",
+    .method = HTTP_GET,
+    .handler = captive_204_handler,
+};
+
 static void start_webserver(void) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.lru_purge_enable = true;
-    config.max_uri_handlers = 10;
+    config.max_uri_handlers = 20;
 
     if (httpd_start(&server, &config) == ESP_OK) {
+        // Main endpoints
         httpd_register_uri_handler(server, &root_uri);
         httpd_register_uri_handler(server, &token_uri);
         httpd_register_uri_handler(server, &status_uri);
@@ -773,41 +951,50 @@ static void start_webserver(void) {
         httpd_register_uri_handler(server, &save_sta_uri);
         httpd_register_uri_handler(server, &save_ap_uri);
         httpd_register_uri_handler(server, &save_nat_uri);
-        ESP_LOGI(TAG, "Web server started");
+        
+        // Captive portal endpoints (fix "Kein Internet")
+        httpd_register_uri_handler(server, &captive_204_uri);
+        httpd_register_uri_handler(server, &captive_connectivity_uri);
+        httpd_register_uri_handler(server, &captive_success_uri);
+        httpd_register_uri_handler(server, &captive_apple_uri);
+        httpd_register_uri_handler(server, &captive_hotspot_uri);
+        httpd_register_uri_handler(server, &captive_library_uri);
+        httpd_register_uri_handler(server, &captive_ncsi_uri);
+        httpd_register_uri_handler(server, &captive_canonical_uri);
+        httpd_register_uri_handler(server, &captive_apple_site_uri);
+        
+        ESP_LOGI(TAG, "Web server started with captive portal support");
     }
 }
 
-// ================= INTERNET CHECK TASK =================
+// ================= INTERNET CHECK TASK (FIXED) =================
 static void internet_check_task(void *pv) {
     esp_task_wdt_add(NULL);
     for (;;) {
         esp_task_wdt_reset();
 
+        // Kiểm tra thực tế: STA đã kết nối và NAT đã bật
+        EventBits_t bits = xEventGroupGetBits(wifi_event_group);
+        bool sta_connected = (bits & WIFI_CONNECTED_BIT) != 0;
+
         xSemaphoreTake(state_mutex, portMAX_DELAY);
         bool nat_e = nat_enabled;
         xSemaphoreGive(state_mutex);
 
-        bool ok;
-        if (nat_e) {
-            struct netif *netif = netif_default;
-            if (netif && netif_is_up(netif)) {
-                // FIX: dns_getserver() trên bản lwIP này chỉ nhận 1 tham số
-                // (chỉ số DNS server) và TRẢ VỀ con trỏ, không còn kiểu cũ
-                // "ghi ra tham số thứ 2" nữa.
-                const ip_addr_t *dns_ip = dns_getserver(0);
-                ok = (dns_ip != NULL) && !ip_addr_isany(dns_ip);
-            } else {
-                ok = false;
-            }
-        } else {
-            ok = false;
-        }
+        // Internet OK nếu STA đã kết nối VÀ NAT đã bật
+        bool ok = sta_connected && nat_e;
 
         xSemaphoreTake(state_mutex, portMAX_DELAY);
         internet_ok = ok;
         xSemaphoreGive(state_mutex);
 
-        vTaskDelay(pdMS_TO_TICKS(20000));
+        if (ok) {
+            ESP_LOGI(TAG, "✅ Internet: ONLINE (STA connected + NAT enabled)");
+        } else {
+            ESP_LOGI(TAG, "❌ Internet: OFFLINE (STA=%d, NAT=%d)", sta_connected, nat_e);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(10000));
     }
 }
 
@@ -876,6 +1063,9 @@ void app_main(void) {
     // FIX #4: task nền tự thử kết nối lại STA định kỳ, không còn bỏ cuộc mãi mãi
     xTaskCreate(sta_reconnect_task, "sta_reconnect", 3072, NULL, 2, NULL);
 
+    // Start DNS Captive Portal task
+    xTaskCreate(dns_captive_task, "dns_captive", 4096, NULL, 5, NULL);
+
     // Blink LED (GPIO2)
     gpio_config_t io_conf = {
         .pin_bit_mask = (1ULL << 2),
@@ -895,6 +1085,7 @@ void app_main(void) {
 
     ESP_LOGI(TAG, "APEX ULTRA Ready! AP: %s", ap_ssid);
     ESP_LOGI(TAG, "Connect to http://192.168.4.1");
+    ESP_LOGI(TAG, "✅ Captive Portal: DNS + HTTP handlers enabled");
 
     // Main loop - just keep running
     while (1) {
