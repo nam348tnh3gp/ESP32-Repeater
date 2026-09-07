@@ -118,55 +118,101 @@ static int config_request_count = 0;
 // HTML trang chủ
 static const char *index_html_tmpl =
 "<!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1'>"
+"<link rel='icon' href='data:,'>"
 "<title>APEX ULTRA</title>"
 "<style>"
-"*{box-sizing:border-box;}body{font-family:Arial;background:#020617;color:#f8fafc;padding:15px;}"
+"*{box-sizing:border-box;}body{font-family:Arial;background:#020617;color:#f8fafc;padding:15px;max-width:480px;margin:0 auto;}"
 ".card{background:#1e293b;padding:20px;margin-bottom:15px;border-radius:12px;}"
-"input,select{width:100%;padding:12px;margin:8px 0;border-radius:8px;background:#0f172a;color:white;border:1px solid #334155;}"
-"button{width:100%;padding:14px;background:#38bdf8;color:#020617;border:none;border-radius:8px;font-weight:bold;cursor:pointer;}"
-".warning{color:#f59e0b;}"
+"label{display:block;font-size:13px;color:#94a3b8;margin-top:8px;}"
+"input,select{width:100%;padding:12px;margin:4px 0;border-radius:8px;background:#0f172a;color:white;border:1px solid #334155;}"
+"input:invalid{border-color:#f87171;}"
+"button{width:100%;padding:14px;margin-top:10px;background:#38bdf8;color:#020617;border:none;border-radius:8px;font-weight:bold;cursor:pointer;}"
+"button:disabled{background:#475569;color:#94a3b8;cursor:wait;}"
+".warning{color:#f59e0b;margin-top:8px;}"
+".hint{font-size:12px;color:#64748b;margin:2px 0 0;}"
+".msg{font-size:13px;margin-top:8px;min-height:16px;}"
+".msg.ok{color:#4ade80;}.msg.err{color:#f87171;}"
+".offline{color:#f87171;}"
 "</style>"
 "</head><body>"
 "<div class='card'><h3>APEX ULTRA V22.0.2 - ESP-IDF (Fixed)</h3>"
 "<div>RAM: <b id='ram'>0</b> KB</div>"
 "<div>Internet: <span id='net'>WAIT</span></div>"
 "<div>NAT: <span id='nat'>WAIT</span></div>"
+"<div>Uplink: <span id='staStatus'>WAIT</span></div>"
+"<div>Signal: <b id='rssi'>-</b> dBm</div>"
 "<div>Clients: <b id='clientCount'>0</b> / <b id='clientLimit'>7</b></div>"
 "<div id='weakWarn' class='warning' style='display:none;'>⚠️ Đang dùng mật khẩu AP mặc định — hãy đổi ngay!</div>"
+"<div id='pollErr' class='msg err' style='display:none;'>⚠️ Mất kết nối tới thiết bị — đang thử lại...</div>"
 "</div>"
 "<div class='card'><h3>Uplink Configuration</h3>"
-"<form action='/save-sta' method='get' class='authForm'>"
-"<input name='ssid' id='ssidInp' placeholder='WiFi Name' required maxlength='32'>"
-"<input name='pass' type='password' placeholder='Password' maxlength='63'>"
+"<form id='staForm' action='/save-sta' method='post' class='authForm'>"
+"<label for='staSsidInp'>Tên WiFi cần kết nối</label>"
+"<input name='ssid' id='staSsidInp' placeholder='WiFi Name' required maxlength='32'>"
+"<label for='staPassInp'>Mật khẩu</label>"
+"<input name='pass' id='staPassInp' type='password' placeholder='Password' maxlength='63'>"
 "<input type='hidden' name='token' class='tokenField' value=''>"
 "<button type='submit'>Connect</button>"
+"<div class='msg' id='staMsg'></div>"
 "</form></div>"
 "<div class='card'><h3>AP Configuration</h3>"
-"<form action='/save-ap' method='get' class='authForm'>"
-"<input name='ssid' placeholder='AP SSID' value='APEX_ULTRA' maxlength='32'>"
-"<input name='pass' type='password' placeholder='Password (min 8)' maxlength='63'>"
+"<form id='apForm' action='/save-ap' method='post' class='authForm'>"
+"<label for='apSsidInp'>Tên WiFi phát ra (AP SSID)</label>"
+"<input name='ssid' id='apSsidInp' placeholder='AP SSID' maxlength='32'>"
+"<label for='apPassInp'>Mật khẩu mới (tối thiểu 8 ký tự)</label>"
+"<input name='pass' id='apPassInp' type='password' placeholder='Password (min 8)' minlength='8' maxlength='63'>"
+"<p class='hint'>Để trống nếu không muốn đổi mật khẩu.</p>"
 "<input type='hidden' name='token' class='tokenField' value=''>"
 "<button type='submit'>Save & Reboot</button>"
+"<div class='msg' id='apMsg'></div>"
 "</form></div>"
 "<div class='card'><h3>NAT Settings</h3>"
-"<form action='/save-nat' method='get' class='authForm'>"
-"<input name='slots' placeholder='NAPT Slots' value='512'>"
-"<input name='tcp' placeholder='TCP ports' value='256'>"
+"<form id='natForm' action='/save-nat' method='post' class='authForm'>"
+"<label for='natSlotsInp'>NAPT Slots (64-4096)</label>"
+"<input name='slots' id='natSlotsInp' type='number' min='64' max='4096' placeholder='NAPT Slots' value='512'>"
+"<label for='natTcpInp'>TCP ports (32-2048)</label>"
+"<input name='tcp' id='natTcpInp' type='number' min='32' max='2048' placeholder='TCP ports' value='256'>"
 "<input type='hidden' name='token' class='tokenField' value=''>"
 "<button type='submit'>Save & Reboot</button>"
+"<div class='msg' id='natMsg'></div>"
 "</form></div>"
 "<script>"
+"let pollFailed=0;"
 "function fetchData(){fetch('/api/status').then(r=>r.json()).then(d=>{"
+"pollFailed=0;document.getElementById('pollErr').style.display='none';"
 "document.getElementById('ram').innerText=Math.round(d.ram/1024);"
 "document.getElementById('net').innerText=d.internet?'ONLINE':'OFFLINE';"
 "document.getElementById('nat').innerText=d.nat?'ACTIVE':'OFF';"
+"document.getElementById('staStatus').innerText=d.staConnected?('Connected: '+d.staSsid):(d.staSsid?'Connecting to '+d.staSsid+'...':'Not configured');"
+"document.getElementById('rssi').innerText=d.staConnected?d.rssi:'-';"
 "document.getElementById('clientCount').innerText=d.clients;"
 "document.getElementById('weakWarn').style.display=d.weakPassword?'block':'none';"
-"});}"
+"}).catch(()=>{pollFailed++;if(pollFailed>=2)document.getElementById('pollErr').style.display='block';});}"
 "setInterval(fetchData,2000);fetchData();"
+"function loadConfig(){fetch('/api/config').then(r=>r.json()).then(c=>{"
+"document.getElementById('apSsidInp').value=c.apSsid;"
+"if(c.staSsid){document.getElementById('staSsidInp').value=c.staSsid;}"
+"});}"
+"loadConfig();"
 "fetch('/get-token').then(r=>r.json()).then(t=>{"
 "document.querySelectorAll('.tokenField').forEach(el=>el.value=t.token);"
 "});"
+"function bindForm(formId,msgId,rebootWarn){"
+"const form=document.getElementById(formId);"
+"const msg=document.getElementById(msgId);"
+"const btn=form.querySelector('button');"
+"form.addEventListener('submit',function(ev){"
+"ev.preventDefault();"
+"btn.disabled=true;btn.innerText='Đang lưu...';"
+"msg.className='msg';msg.innerText='';"
+"fetch(form.action,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams(new FormData(form)).toString()})"
+".then(async r=>{const t=await r.text();if(r.ok){msg.className='msg ok';msg.innerText=t+(rebootWarn?' Thiết bị sẽ mất kết nối vài giây...':'');}"
+"else{msg.className='msg err';msg.innerText=t;btn.disabled=false;btn.innerText='Retry';}})"
+".catch(()=>{msg.className='msg err';msg.innerText='Không thể kết nối tới thiết bị.';btn.disabled=false;btn.innerText='Retry';});"
+"});}"
+"bindForm('staForm','staMsg',true);"
+"bindForm('apForm','apMsg',true);"
+"bindForm('natForm','natMsg',true);"
 "</script></body></html>";
 
 // ================= UTILITY FUNCTIONS =================
@@ -422,10 +468,37 @@ static void wifi_init(void) {
 }
 
 // ================= AUTH / RATE LIMIT (FIX #3) =================
-static bool check_auth_and_rate(httpd_req_t *req, char *query, size_t query_len) {
+// FIX (UX/security v2): các endpoint save-* giờ nhận POST với body dạng
+// application/x-www-form-urlencoded thay vì GET query string - tránh lộ
+// mật khẩu qua URL/lịch sử trình duyệt/log. read_post_body() đọc toàn bộ
+// body vào buffer (đã null-terminate), sau đó check_auth_and_rate() phân
+// tích token trực tiếp từ buffer đó bằng httpd_query_key_value() (định
+// dạng key=value&... giống hệt query string nên dùng lại được hàm này).
+static bool read_post_body(httpd_req_t *req, char *buf, size_t buf_size) {
+    int total_len = req->content_len;
+    if (total_len <= 0 || (size_t)total_len >= buf_size) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_send(req, "Invalid or too large request body", HTTPD_RESP_USE_STRLEN);
+        return false;
+    }
+    int received = 0;
+    while (received < total_len) {
+        int ret = httpd_req_recv(req, buf + received, total_len - received);
+        if (ret == HTTPD_SOCK_ERR_TIMEOUT) continue;
+        if (ret <= 0) {
+            httpd_resp_set_status(req, "400 Bad Request");
+            httpd_resp_send(req, "Failed to read request body", HTTPD_RESP_USE_STRLEN);
+            return false;
+        }
+        received += ret;
+    }
+    buf[total_len] = '\0';
+    return true;
+}
+
+static bool check_auth_and_rate(const char *body, httpd_req_t *req) {
     char token[24] = {0};
-    bool has_token = (httpd_req_get_url_query_str(req, query, query_len) == ESP_OK) &&
-                      (httpd_query_key_value(query, "token", token, sizeof(token)) == ESP_OK);
+    bool has_token = httpd_query_key_value(body, "token", token, sizeof(token)) == ESP_OK;
 
     if (!has_token || strcmp(token, session_token) != 0) {
         httpd_resp_set_status(req, "401 Unauthorized");
@@ -461,7 +534,7 @@ static esp_err_t token_get_handler(httpd_req_t *req) {
 }
 
 static esp_err_t status_get_handler(httpd_req_t *req) {
-    char buffer[300];
+    char buffer[400];
     uint32_t free_heap = esp_get_free_heap_size();
 
     xSemaphoreTake(state_mutex, portMAX_DELAY);
@@ -471,22 +544,40 @@ static esp_err_t status_get_handler(httpd_req_t *req) {
     int rssi = last_rssi;
     xSemaphoreGive(state_mutex);
 
+    bool sta_connected = (xEventGroupGetBits(wifi_event_group) & WIFI_CONNECTED_BIT) != 0;
+
     snprintf(buffer, sizeof(buffer),
-        "{\"ram\":%lu,\"internet\":%s,\"nat\":%s,\"clients\":%d,\"rssi\":%d,\"weakPassword\":%s}",
+        "{\"ram\":%lu,\"internet\":%s,\"nat\":%s,\"clients\":%d,\"rssi\":%d,"
+        "\"staConnected\":%s,\"staSsid\":\"%s\",\"weakPassword\":%s}",
         (unsigned long)free_heap,
         inet ? "true" : "false",
         nat_e ? "true" : "false",
         clients,
         rssi,
+        sta_connected ? "true" : "false",
+        sta_ssid,
         (strcmp(ap_pass, "12345678") == 0) ? "true" : "false");
 
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_send(req, buffer, strlen(buffer));
 }
 
+// FIX (UX): endpoint không cần token - chỉ trả về SSID hiện tại (không phải
+// mật khẩu) để UI tự điền sẵn form thay vì luôn hiện placeholder/giá trị
+// mặc định cứng, dễ khiến người dùng tưởng nhầm cấu hình hiện tại.
+static esp_err_t config_get_handler(httpd_req_t *req) {
+    char buffer[200];
+    snprintf(buffer, sizeof(buffer),
+        "{\"apSsid\":\"%s\",\"staSsid\":\"%s\"}",
+        ap_ssid, sta_ssid);
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(req, buffer, strlen(buffer));
+}
+
 static esp_err_t save_sta_get_handler(httpd_req_t *req) {
     char query[QUERY_VALUE_LEN * 3];
-    if (!check_auth_and_rate(req, query, sizeof(query))) return ESP_OK;
+    if (!read_post_body(req, query, sizeof(query))) return ESP_OK;
+    if (!check_auth_and_rate(query, req)) return ESP_OK;
 
     char ssid[SSID_BUF_LEN] = {0};
     char pass[PASS_BUF_LEN] = {0};
@@ -519,7 +610,8 @@ static esp_err_t save_sta_get_handler(httpd_req_t *req) {
 
 static esp_err_t save_ap_get_handler(httpd_req_t *req) {
     char query[QUERY_VALUE_LEN * 3];
-    if (!check_auth_and_rate(req, query, sizeof(query))) return ESP_OK;
+    if (!read_post_body(req, query, sizeof(query))) return ESP_OK;
+    if (!check_auth_and_rate(query, req)) return ESP_OK;
 
     char ssid[SSID_BUF_LEN] = {0};
     char pass[PASS_BUF_LEN] = {0};
@@ -549,7 +641,8 @@ static esp_err_t save_ap_get_handler(httpd_req_t *req) {
 
 static esp_err_t save_nat_get_handler(httpd_req_t *req) {
     char query[QUERY_VALUE_LEN * 2];
-    if (!check_auth_and_rate(req, query, sizeof(query))) return ESP_OK;
+    if (!read_post_body(req, query, sizeof(query))) return ESP_OK;
+    if (!check_auth_and_rate(query, req)) return ESP_OK;
 
     char value[16];
 
@@ -591,33 +684,40 @@ static const httpd_uri_t status_uri = {
     .handler = status_get_handler,
 };
 
+static const httpd_uri_t config_uri = {
+    .uri = "/api/config",
+    .method = HTTP_GET,
+    .handler = config_get_handler,
+};
+
 static const httpd_uri_t save_sta_uri = {
     .uri = "/save-sta",
-    .method = HTTP_GET,
+    .method = HTTP_POST,
     .handler = save_sta_get_handler,
 };
 
 static const httpd_uri_t save_ap_uri = {
     .uri = "/save-ap",
-    .method = HTTP_GET,
+    .method = HTTP_POST,
     .handler = save_ap_get_handler,
 };
 
 static const httpd_uri_t save_nat_uri = {
     .uri = "/save-nat",
-    .method = HTTP_GET,
+    .method = HTTP_POST,
     .handler = save_nat_get_handler,
 };
 
 static void start_webserver(void) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.lru_purge_enable = true;
-    config.max_uri_handlers = 8;
+    config.max_uri_handlers = 9;
 
     if (httpd_start(&server, &config) == ESP_OK) {
         httpd_register_uri_handler(server, &root_uri);
         httpd_register_uri_handler(server, &token_uri);
         httpd_register_uri_handler(server, &status_uri);
+        httpd_register_uri_handler(server, &config_uri);
         httpd_register_uri_handler(server, &save_sta_uri);
         httpd_register_uri_handler(server, &save_ap_uri);
         httpd_register_uri_handler(server, &save_nat_uri);
