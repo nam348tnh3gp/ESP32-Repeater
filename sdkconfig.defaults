@@ -6,3 +6,13 @@ CONFIG_ESP_TASK_WDT_TIMEOUT_S=10
 CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0=y
 CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1=y
 CONFIG_ESP_HTTP_SERVER_ENABLE=y
+
+# FIX: khai báo tường minh dung lượng flash khớp với board esp32dev (4MB)
+# để hết cảnh báo "Flash memory size mismatch detected. Expected 4MB, found 2MB!"
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="4MB"
+
+# Dùng bảng phân vùng mặc định "Single factory app, no OTA" của ESP-IDF -
+# đủ dùng cho firmware này (không cần OTA/multi-app), khớp với việc đã bỏ
+# board_build.partitions=default.csv trong platformio.ini.
+CONFIG_PARTITION_TABLE_SINGLE_APP=y
