@@ -20,16 +20,41 @@ jobs:
         with:
           python-version: '3.x'
 
-      - name: Install PlatformIO
+      - name: Install PlatformIO & esptool
         run: |
           python -m pip install --upgrade pip
-          pip install platformio
+          pip install platformio esptool
 
       - name: Build firmware
         run: pio run
 
-      - name: Upload firmware binary
+      - name: Merge 3 files into 1 (merged.bin)
+        run: |
+          cd .pio/build/esp32dev/
+          esptool.py --chip esp32 merge_bin -o merged.bin \
+            0x1000 bootloader.bin \
+            0x8000 partitions.bin \
+            0x10000 firmware.bin
+          echo "✅ Merged file created: merged.bin"
+          ls -lh merged.bin
+
+      - name: Upload merged firmware (1 file duy nhất)
         uses: actions/upload-artifact@v4
         with:
-          name: firmware-bin
-          path: .pio/build/esp32dev/firmware.bin
+          name: esp32-nat-router
+          path: .pio/build/esp32dev/merged.bin
+
+      - name: Upload individual files (optional, để debug)
+        uses: actions/upload-artifact@v4
+        with:
+          name: esp32-individual-files
+          path: |
+            .pio/build/esp32dev/bootloader.bin
+            .pio/build/esp32dev/partitions.bin
+            .pio/build/esp32dev/firmware.bin
+
+      - name: Verify build
+        run: |
+          echo "📦 File merged.bin size:"
+          ls -lh .pio/build/esp32dev/merged.bin
+          echo "✅ Build and merge successful!"
