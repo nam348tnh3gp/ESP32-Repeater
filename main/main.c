@@ -30,19 +30,10 @@
 #include "lwip/dns.h"
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
+#include "lwip/inet.h"   // <-- thêm để dùng inet_addr()
 
 #include "esp_http_server.h"
 #include "cJSON.h"
-
-// ================= NAT DECLARATIONS =================
-// FIX (napt v3): các hàm lwIP nội bộ ip_napt_init()/ip_napt_disable()/
-// sys_lock_tcpip_core() không còn là API công khai ổn định từ ESP-IDF v5.1+
-// (NAPT đã được tái cấu trúc, kích thước bảng NAT giờ lấy từ Kconfig thay vì
-// gọi ip_napt_init() thủ công). Cách được ESP-IDF khuyến nghị và ổn định
-// giữa các phiên bản là dùng API cấp cao esp_netif_napt_enable()/
-// esp_netif_napt_disable() trong "esp_netif.h" (đã include ở trên) - các
-// hàm này tự lo việc khóa TCP/IP core bên trong, không cần gọi
-// sys_lock_tcpip_core()/sys_unlock_tcpip_core() ở code ứng dụng nữa.
 
 // ================= DEFINES =================
 #define AP_SSID "APEX_ULTRA"
@@ -60,20 +51,13 @@
 #define WIFI_FAIL_BIT BIT1
 
 #define STA_MAX_RETRY 5
-// FIX #4: sau khi hết lượt retry ban đầu, vẫn thử kết nối lại định kỳ thay vì
-// bỏ cuộc vĩnh viễn.
 #define STA_RECONNECT_BACKOFF_MS 30000
 
 #define WATCHDOG_TIMEOUT_S 45
 
-// FIX #3: cấu hình rate-limit cho control plane
 #define CONFIG_RATE_WINDOW_MS 5000
 #define CONFIG_RATE_MAX_REQ   3
 
-// Kích thước buffer thống nhất cho mọi chuỗi liên quan tới WiFi, khớp với
-// giới hạn thật của wifi_config_t (ssid tối đa 32 byte gồm null, password
-// tối đa 64 byte gồm null). Dùng chung 1 hằng số để không còn lệch size
-// giữa các buffer như bản gốc.
 #define SSID_BUF_LEN 33
 #define PASS_BUF_LEN 65
 #define QUERY_VALUE_LEN 96
@@ -87,11 +71,9 @@ static bool sta_configured = false;
 
 static httpd_handle_t server = NULL;
 
-// FIX #6: bảo vệ các biến trạng thái dùng chung giữa nhiều task bằng 1 mutex
-// nhẹ thay vì đọc/ghi trực tiếp không đồng bộ.
 static SemaphoreHandle_t state_mutex;
 static bool nat_enabled = false;
-static esp_netif_t *s_ap_netif = NULL; // handle của AP netif, dùng cho esp_netif_napt_enable/disable
+static esp_netif_t *s_ap_netif = NULL;
 static bool internet_ok = false;
 static int current_clients = 0;
 static int last_rssi = -100;
@@ -100,9 +82,6 @@ static char sta_ssid[SSID_BUF_LEN] = {0};
 static char sta_pass[PASS_BUF_LEN] = {0};
 static char ap_ssid[SSID_BUF_LEN] = "APEX_ULTRA";
 static char ap_pass[PASS_BUF_LEN] = "12345678";
-// FIX: nvs_get_i32() yêu cầu chính xác kiểu int32_t* (trên toolchain này
-// int32_t là 'long', khác kiểu 'int' dù cùng 4 byte) -> khai báo int32_t
-// thay vì int để tránh lỗi "incompatible pointer type".
 static int32_t ap_channel = AP_CHANNEL;
 static int32_t max_clients = AP_MAX_CONN;
 
@@ -111,18 +90,16 @@ static int32_t nat_tcp = NAT_MAX_TCP;
 
 static nvs_handle_t s_nvs_handle;
 
-// FIX #3: mutex bảo vệ ghi NVS + token phiên chống truy cập trái phép
 static SemaphoreHandle_t nvs_mutex;
 static char session_token[24] = {0};
 static unsigned long last_config_window_ms = 0;
 static int config_request_count = 0;
 
 // ================= CAPTIVE PORTAL FIX =================
-// DNS Socket cho captive portal
-static int dns_socket = -1;
+static int dns_socket = -1;          // (không bắt buộc dùng)
 static TaskHandle_t dns_task_handle = NULL;
 
-// HTML trang chủ
+// HTML trang chủ (giữ nguyên)
 static const char *index_html_tmpl =
 "<!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1'>"
 "<link rel='icon' href='data:,'>"
@@ -229,96 +206,128 @@ static const char *index_html_tmpl =
 "bindForm('natForm','natMsg',true);"
 "</script></body></html>";
 
+// ================= HÀM KIỂM TRA INTERNET =================
+static bool is_internet_available(void) {
+    bool ok;
+    xSemaphoreTake(state_mutex, portMAX_DELAY);
+    ok = internet_ok;
+    xSemaphoreGive(state_mutex);
+    return ok;
+}
+
 // ================= CAPTIVE PORTAL DNS SERVER =================
 static void dns_captive_task(void *pv) {
     struct sockaddr_in server_addr, client_addr;
     socklen_t addr_len = sizeof(client_addr);
     uint8_t buffer[512];
-    
+
     // Tạo socket UDP
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (sock < 0) {
         ESP_LOGE(TAG, "DNS: Failed to create socket");
         return;
     }
-    
+
     // Bind tới port 53 (DNS)
     server_addr.sin_family = AF_INET;
     server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
     server_addr.sin_port = htons(53);
-    
+
     if (bind(sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
         ESP_LOGE(TAG, "DNS: Failed to bind to port 53");
         close(sock);
         return;
     }
-    
+
     ESP_LOGI(TAG, "✅ DNS Captive Portal started on port 53");
-    
+
     while (1) {
-        int len = recvfrom(sock, buffer, sizeof(buffer), 0, 
+        int len = recvfrom(sock, buffer, sizeof(buffer), 0,
                           (struct sockaddr *)&client_addr, &addr_len);
         if (len > 0) {
-            // Xây dựng DNS response
-            uint8_t response[512];
-            memset(response, 0, sizeof(response));
-            
-            // Copy header + question
-            int resp_len = len;
-            memcpy(response, buffer, len);
-            
-            // Set flags: response + authoritative
-            response[2] = 0x85;  // QR=1, AA=1
-            response[3] = 0x80;  // RA=1
-            
-            // Answer count = 1
-            response[6] = 0x00;
-            response[7] = 0x01;
-            
-            // Tìm vị trí bắt đầu của QNAME
-            int qname_start = 12;
-            int qname_len = 0;
-            for (int i = qname_start; i < len; i++) {
-                if (buffer[i] == 0) {
-                    qname_len = i - qname_start;
-                    break;
+            bool internet = is_internet_available();
+
+            if (internet) {
+                // Forward DNS query tới DNS upstream (8.8.8.8)
+                int upstream_sock = socket(AF_INET, SOCK_DGRAM, 0);
+                if (upstream_sock >= 0) {
+                    struct sockaddr_in upstream_addr;
+                    upstream_addr.sin_family = AF_INET;
+                    upstream_addr.sin_port = htons(53);
+                    upstream_addr.sin_addr.s_addr = inet_addr("8.8.8.8");
+
+                    sendto(upstream_sock, buffer, len, 0,
+                           (struct sockaddr *)&upstream_addr, sizeof(upstream_addr));
+
+                    // Timeout 1 giây để nhận phản hồi
+                    struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
+                    setsockopt(upstream_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+                    uint8_t upstream_resp[512];
+                    int up_len = recv(upstream_sock, upstream_resp, sizeof(upstream_resp), 0);
+                    if (up_len > 0) {
+                        // Gửi lại phản hồi cho client
+                        sendto(sock, upstream_resp, up_len, 0,
+                               (struct sockaddr *)&client_addr, addr_len);
+                    }
+                    close(upstream_sock);
                 }
+            } else {
+                // Xây dựng DNS response giả trả IP AP (192.168.4.1)
+                uint8_t response[512];
+                memset(response, 0, sizeof(response));
+
+                int resp_len = len;
+                memcpy(response, buffer, len);
+
+                response[2] = 0x85;  // QR=1, AA=1
+                response[3] = 0x80;  // RA=1
+                response[6] = 0x00;
+                response[7] = 0x01;  // Answer count = 1
+
+                // Tìm vị trí bắt đầu của QNAME
+                int qname_start = 12;
+                int qname_len = 0;
+                for (int i = qname_start; i < len; i++) {
+                    if (buffer[i] == 0) {
+                        qname_len = i - qname_start;
+                        break;
+                    }
+                }
+
+                int off = qname_start + qname_len + 1;
+                response[off++] = 0xC0;
+                response[off++] = 0x0C;
+
+                // Type A (1)
+                response[off++] = 0x00;
+                response[off++] = 0x01;
+
+                // Class IN (1)
+                response[off++] = 0x00;
+                response[off++] = 0x01;
+
+                // TTL (60 seconds)
+                response[off++] = 0x00;
+                response[off++] = 0x00;
+                response[off++] = 0x00;
+                response[off++] = 0x3C;
+
+                // Data length: 4 bytes
+                response[off++] = 0x00;
+                response[off++] = 0x04;
+
+                // IP: 192.168.4.1
+                response[off++] = 192;
+                response[off++] = 168;
+                response[off++] = 4;
+                response[off++] = 1;
+
+                resp_len = off;
+
+                sendto(sock, response, resp_len, 0,
+                       (struct sockaddr *)&client_addr, addr_len);
             }
-            
-            // Pointer to domain name (compressed)
-            int off = qname_start + qname_len + 1;
-            response[off++] = 0xC0;
-            response[off++] = 0x0C;
-            
-            // Type A (1)
-            response[off++] = 0x00;
-            response[off++] = 0x01;
-            
-            // Class IN (1)
-            response[off++] = 0x00;
-            response[off++] = 0x01;
-            
-            // TTL (60 seconds)
-            response[off++] = 0x00;
-            response[off++] = 0x00;
-            response[off++] = 0x00;
-            response[off++] = 0x3C;
-            
-            // Data length: 4 bytes (IPv4)
-            response[off++] = 0x00;
-            response[off++] = 0x04;
-            
-            // IP: 192.168.4.1 (AP IP)
-            response[off++] = 192;
-            response[off++] = 168;
-            response[off++] = 4;
-            response[off++] = 1;
-            
-            resp_len = off;
-            
-            // Gửi response
-            sendto(sock, response, resp_len, 0, 
-                   (struct sockaddr *)&client_addr, addr_len);
         }
         vTaskDelay(pdMS_TO_TICKS(1));
     }
@@ -327,28 +336,36 @@ static void dns_captive_task(void *pv) {
 
 // ================= CAPTIVE PORTAL HTTP HANDLERS =================
 static esp_err_t captive_204_handler(httpd_req_t *req) {
-    httpd_resp_set_status(req, "204 No Content");
-    httpd_resp_send(req, NULL, 0);
+    if (is_internet_available()) {
+        // Khi có Internet thật, trả 404 để tránh bị coi là captive portal
+        httpd_resp_set_status(req, "404 Not Found");
+        httpd_resp_send(req, NULL, 0);
+    } else {
+        // Khi chưa có Internet, giữ captive portal
+        httpd_resp_set_status(req, "204 No Content");
+        httpd_resp_send(req, NULL, 0);
+    }
     return ESP_OK;
 }
 
 static esp_err_t captive_success_handler(httpd_req_t *req) {
-    const char *html = "<!DOCTYPE html><html><head><meta charset='UTF-8'><title>Internet OK</title></head>"
-                       "<body style='font-family:Arial;text-align:center;padding:50px;'>"
-                       "<h1>✅ Internet Connection OK</h1>"
-                       "<p>You can now browse the internet.</p>"
-                       "<a href='http://192.168.4.1'>Go to Dashboard</a>"
-                       "</body></html>";
-    httpd_resp_set_type(req, "text/html");
-    httpd_resp_send(req, html, strlen(html));
+    if (is_internet_available()) {
+        httpd_resp_set_status(req, "404 Not Found");
+        httpd_resp_send(req, NULL, 0);
+    } else {
+        const char *html = "<!DOCTYPE html><html><head><meta charset='UTF-8'><title>Internet OK</title></head>"
+                           "<body style='font-family:Arial;text-align:center;padding:50px;'>"
+                           "<h1>✅ Internet Connection OK</h1>"
+                           "<p>You can now browse the internet.</p>"
+                           "<a href='http://192.168.4.1'>Go to Dashboard</a>"
+                           "</body></html>";
+        httpd_resp_set_type(req, "text/html");
+        httpd_resp_send(req, html, strlen(html));
+    }
     return ESP_OK;
 }
 
 // ================= UTILITY FUNCTIONS =================
-// FIX #1 (CRITICAL): url_decode giờ nhận thêm dst_size và KHÔNG BAO GIỜ ghi
-// vượt quá biên của buffer đích, kể cả khi chuỗi nguồn dài hơn. Đây là fix
-// cho lỗi stack buffer overflow qua /save-ap (và mọi endpoint khác dùng
-// hàm này).
 static void url_decode(char *dst, size_t dst_size, const char *src) {
     if (dst_size == 0) return;
     size_t out = 0;
@@ -428,12 +445,6 @@ static void enable_nat(void) {
     xSemaphoreGive(state_mutex);
     if (already) return;
 
-    // FIX (napt v3): dùng esp_netif_napt_enable() thay vì gọi thẳng
-    // ip_napt_init()/ip_napt_enable() của lwIP - kích thước bảng NAT/portmap
-    // (nat_slots/nat_tcp) giờ được cấu hình qua Kconfig
-    // (CONFIG_LWIP_NAT_MAX / CONFIG_LWIP_NAT_PORTMAP_MAX trong sdkconfig),
-    // không còn truyền runtime được nữa - nat_slots/nat_tcp chỉ còn dùng để
-    // log lại giá trị cấu hình mong muốn.
     if (s_ap_netif == NULL) {
         ESP_LOGE(TAG, "enable_nat: AP netif chưa được khởi tạo");
         return;
@@ -480,15 +491,10 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
             s_retry_num++;
             ESP_LOGI(TAG, "Retry connecting... (%d/%d)", s_retry_num, STA_MAX_RETRY);
         } else {
-            // FIX #4: không còn bỏ cuộc vĩnh viễn. Báo FAIL cho lần chờ đầu
-            // tiên ở app_main(), nhưng vẫn để 1 task nền định kỳ thử kết nối
-            // lại (xem sta_reconnect_task) thay vì im lặng mất uplink mãi mãi.
             xEventGroupSetBits(wifi_event_group, WIFI_FAIL_BIT);
             ESP_LOGW(TAG, "STA retry exhausted, will retry again in background every %d s",
                      STA_RECONNECT_BACKOFF_MS / 1000);
         }
-        // FIX: mất uplink STA thì tắt NAT luôn (tránh forward vào interface
-        // đã chết), đồng thời khiến disable_nat() được sử dụng thật.
         disable_nat();
         ESP_LOGI(TAG, "STA disconnected");
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_STACONNECTED) {
@@ -513,8 +519,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
     }
 }
 
-// FIX #4: task nền định kỳ thử kết nối lại STA nếu đang cấu hình STA mà
-// hiện không có IP (thay vì bỏ cuộc vĩnh viễn sau STA_MAX_RETRY lần).
+// FIX #4: task nền định kỳ thử kết nối lại STA
 static void sta_reconnect_task(void *pv) {
     esp_task_wdt_add(NULL);
     for (;;) {
@@ -554,7 +559,6 @@ static void wifi_init(void) {
                                                         NULL,
                                                         &instance_got_ip));
 
-    // AP config
     wifi_config_t ap_config = {
         .ap = {
             .ssid = "",
@@ -568,7 +572,6 @@ static void wifi_init(void) {
             },
         },
     };
-    // FIX #1: dùng strncpy + đảm bảo null-terminate, không strcpy "mù" nữa.
     strncpy((char *)ap_config.ap.ssid, ap_ssid, sizeof(ap_config.ap.ssid) - 1);
     strncpy((char *)ap_config.ap.password, ap_pass, sizeof(ap_config.ap.password) - 1);
     if (strlen(ap_pass) == 0) {
@@ -578,7 +581,6 @@ static void wifi_init(void) {
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));
 
-    // STA config if available
     if (strlen(sta_ssid) > 0) {
         wifi_config_t sta_config = {
             .sta = {
@@ -596,13 +598,7 @@ static void wifi_init(void) {
     ESP_LOGI(TAG, "WiFi started. AP: %s on channel %d", ap_ssid, (int)ap_channel);
 }
 
-// ================= AUTH / RATE LIMIT (FIX #3) =================
-// FIX (UX/security v2): các endpoint save-* giờ nhận POST với body dạng
-// application/x-www-form-urlencoded thay vì GET query string - tránh lộ
-// mật khẩu qua URL/lịch sử trình duyệt/log. read_post_body() đọc toàn bộ
-// body vào buffer (đã null-terminate), sau đó check_auth_and_rate() phân
-// tích token trực tiếp từ buffer đó bằng httpd_query_key_value() (định
-// dạng key=value&... giống hệt query string nên dùng lại được hàm này).
+// ================= AUTH / RATE LIMIT =================
 static bool read_post_body(httpd_req_t *req, char *buf, size_t buf_size) {
     int total_len = req->content_len;
     if (total_len <= 0 || (size_t)total_len >= buf_size) {
@@ -691,9 +687,6 @@ static esp_err_t status_get_handler(httpd_req_t *req) {
     return httpd_resp_send(req, buffer, strlen(buffer));
 }
 
-// FIX (UX): endpoint không cần token - chỉ trả về SSID hiện tại (không phải
-// mật khẩu) để UI tự điền sẵn form thay vì luôn hiện placeholder/giá trị
-// mặc định cứng, dễ khiến người dùng tưởng nhầm cấu hình hiện tại.
 static esp_err_t config_get_handler(httpd_req_t *req) {
     char buffer[200];
     snprintf(buffer, sizeof(buffer),
@@ -703,10 +696,6 @@ static esp_err_t config_get_handler(httpd_req_t *req) {
     return httpd_resp_send(req, buffer, strlen(buffer));
 }
 
-// FIX (port từ ESP_Code.ino): danh sách client kèm MAC + IP thay vì chỉ đếm
-// số lượng. Dùng API chính thức esp_netif_dhcps_get_clients_by_mac() của
-// ESP-IDF (esp_netif.h) - không đụng vào bảng ARP/DHCP lease nội bộ của
-// lwIP như getIPFromMAC() bên .ino, nên ổn định hơn giữa các phiên bản.
 static esp_err_t clients_get_handler(httpd_req_t *req) {
     wifi_sta_list_t sta_list;
     if (esp_wifi_ap_get_sta_list(&sta_list) != ESP_OK || s_ap_netif == NULL) {
@@ -715,7 +704,7 @@ static esp_err_t clients_get_handler(httpd_req_t *req) {
     }
 
     int num = sta_list.num;
-    if (num > 10) num = 10; // giới hạn để buffer JSON không phình quá lớn
+    if (num > 10) num = 10;
 
     esp_netif_pair_mac_ip_t pairs[10] = {0};
     for (int i = 0; i < num; i++) {
@@ -750,7 +739,6 @@ static esp_err_t save_sta_get_handler(httpd_req_t *req) {
     char pass[PASS_BUF_LEN] = {0};
     char value[QUERY_VALUE_LEN];
 
-    // FIX #1: mọi url_decode() giờ đều truyền kích thước buffer đích thật
     if (httpd_query_key_value(query, "ssid", value, sizeof(value)) == ESP_OK) {
         url_decode(ssid, sizeof(ssid), value);
     }
@@ -784,9 +772,6 @@ static esp_err_t save_ap_get_handler(httpd_req_t *req) {
     char pass[PASS_BUF_LEN] = {0};
     char value[QUERY_VALUE_LEN];
 
-    // FIX #1 (CRITICAL): trước đây gọi url_decode(ssid, value) với
-    // ssid[32] và value[64] không kiểm tra biên -> stack buffer overflow.
-    // Giờ luôn truyền sizeof(ssid)/sizeof(pass) làm giới hạn ghi.
     if (httpd_query_key_value(query, "ssid", value, sizeof(value)) == ESP_OK) {
         url_decode(ssid, sizeof(ssid), value);
         if (strlen(ssid) > 0) strncpy(ap_ssid, ssid, sizeof(ap_ssid) - 1);
@@ -833,6 +818,7 @@ static esp_err_t save_nat_get_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
+// ================= URI DEFINITIONS =================
 static const httpd_uri_t root_uri = {
     .uri = "/",
     .method = HTTP_GET,
@@ -881,7 +867,7 @@ static const httpd_uri_t save_nat_uri = {
     .handler = save_nat_get_handler,
 };
 
-// ================= CAPTIVE PORTAL URIS =================
+// Captive portal URIs
 static const httpd_uri_t captive_204_uri = {
     .uri = "/generate_204",
     .method = HTTP_GET,
@@ -942,7 +928,6 @@ static void start_webserver(void) {
     config.max_uri_handlers = 20;
 
     if (httpd_start(&server, &config) == ESP_OK) {
-        // Main endpoints
         httpd_register_uri_handler(server, &root_uri);
         httpd_register_uri_handler(server, &token_uri);
         httpd_register_uri_handler(server, &status_uri);
@@ -951,8 +936,7 @@ static void start_webserver(void) {
         httpd_register_uri_handler(server, &save_sta_uri);
         httpd_register_uri_handler(server, &save_ap_uri);
         httpd_register_uri_handler(server, &save_nat_uri);
-        
-        // Captive portal endpoints (fix "Kein Internet")
+
         httpd_register_uri_handler(server, &captive_204_uri);
         httpd_register_uri_handler(server, &captive_connectivity_uri);
         httpd_register_uri_handler(server, &captive_success_uri);
@@ -962,18 +946,17 @@ static void start_webserver(void) {
         httpd_register_uri_handler(server, &captive_ncsi_uri);
         httpd_register_uri_handler(server, &captive_canonical_uri);
         httpd_register_uri_handler(server, &captive_apple_site_uri);
-        
+
         ESP_LOGI(TAG, "Web server started with captive portal support");
     }
 }
 
-// ================= INTERNET CHECK TASK (FIXED) =================
+// ================= INTERNET CHECK TASK =================
 static void internet_check_task(void *pv) {
     esp_task_wdt_add(NULL);
     for (;;) {
         esp_task_wdt_reset();
 
-        // Kiểm tra thực tế: STA đã kết nối và NAT đã bật
         EventBits_t bits = xEventGroupGetBits(wifi_event_group);
         bool sta_connected = (bits & WIFI_CONNECTED_BIT) != 0;
 
@@ -981,7 +964,6 @@ static void internet_check_task(void *pv) {
         bool nat_e = nat_enabled;
         xSemaphoreGive(state_mutex);
 
-        // Internet OK nếu STA đã kết nối VÀ NAT đã bật
         bool ok = sta_connected && nat_e;
 
         xSemaphoreTake(state_mutex, portMAX_DELAY);
@@ -1007,7 +989,6 @@ void app_main(void) {
     state_mutex = xSemaphoreCreateMutex();
     nvs_mutex = xSemaphoreCreateMutex();
 
-    // Init NVS
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -1015,13 +996,11 @@ void app_main(void) {
     }
     ESP_ERROR_CHECK(ret);
 
-    // Open NVS
     nvs_open("apex_v22", NVS_READWRITE, &s_nvs_handle);
     load_config();
 
     ESP_LOGI(TAG, "NAT: slots=%d, tcp=%d", (int)nat_slots, (int)nat_tcp);
 
-    // FIX #3: sinh token phiên bằng hardware RNG cho control-plane
     uint32_t r1 = esp_random(), r2 = esp_random();
     snprintf(session_token, sizeof(session_token), "%08lx%08lx", (unsigned long)r1, (unsigned long)r2);
     ESP_LOGI(TAG, "Session token: %s", session_token);
@@ -1029,19 +1008,16 @@ void app_main(void) {
         ESP_LOGW(TAG, "CANH BAO: dang dung mat khau AP mac dinh, hay doi ngay!");
     }
 
-    // FIX #5: bật Task Watchdog cho toàn hệ thống
     esp_task_wdt_config_t wdt_config = {
         .timeout_ms = WATCHDOG_TIMEOUT_S * 1000,
         .idle_core_mask = 0,
         .trigger_panic = true,
     };
     esp_task_wdt_reconfigure(&wdt_config);
-    esp_task_wdt_add(NULL); // đăng ký task app_main (chính là task chạy while(1) bên dưới)
+    esp_task_wdt_add(NULL);
 
-    // Init WiFi
     wifi_init();
 
-    // Wait for connection or timeout
     EventBits_t bits = xEventGroupWaitBits(wifi_event_group,
                                            WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
                                            pdFALSE,
@@ -1054,19 +1030,12 @@ void app_main(void) {
         ESP_LOGI(TAG, "No STA configured or connection failed (will keep retrying in background)");
     }
 
-    // Start web server
     start_webserver();
 
-    // Start internet check task
     xTaskCreate(internet_check_task, "inet_check", 3072, NULL, 2, NULL);
-
-    // FIX #4: task nền tự thử kết nối lại STA định kỳ, không còn bỏ cuộc mãi mãi
     xTaskCreate(sta_reconnect_task, "sta_reconnect", 3072, NULL, 2, NULL);
-
-    // Start DNS Captive Portal task
     xTaskCreate(dns_captive_task, "dns_captive", 4096, NULL, 5, NULL);
 
-    // Blink LED (GPIO2)
     gpio_config_t io_conf = {
         .pin_bit_mask = (1ULL << 2),
         .mode = GPIO_MODE_OUTPUT,
@@ -1087,12 +1056,10 @@ void app_main(void) {
     ESP_LOGI(TAG, "Connect to http://192.168.4.1");
     ESP_LOGI(TAG, "✅ Captive Portal: DNS + HTTP handlers enabled");
 
-    // Main loop - just keep running
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(1000));
-        esp_task_wdt_reset(); // FIX #5: feed watchdog của chính task này
+        esp_task_wdt_reset();
 
-        // Update RSSI
         wifi_ap_record_t ap_info;
         if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
             xSemaphoreTake(state_mutex, portMAX_DELAY);
