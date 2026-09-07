@@ -5,6 +5,6 @@ idf_component_register(SRCS "main.c"
                         esp_wifi
                         esp_event
                         esp_netif
+                        esp_timer
                         lwip
-                        esp_http_server
-                        json)
+                        esp_http_server)
