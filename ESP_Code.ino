@@ -32,10 +32,19 @@
 #include <esp_netif.h>
 #include <esp_chip_info.h>
 #include <atomic>
+#include <math.h>
+#include "soc/soc_caps.h"
 
-#ifndef CONFIG_IDF_TARGET_ESP32C5
+// FIX (fallback đa nền tảng): dùng macro capability chuẩn của ESP-IDF
+// (SOC_TEMP_SENSOR_SUPPORTED, định nghĩa trong soc_caps.h) thay vì loại
+// trừ cứng theo tên chip (CONFIG_IDF_TARGET_ESP32C5). Macro này tự động
+// đúng cho MỌI chip hiện tại và tương lai không có cảm biến nhiệt độ nội
+// bộ (không chỉ riêng C5), nên không cần sửa code mỗi khi có chip mới.
+#if SOC_TEMP_SENSOR_SUPPORTED
 #include <esp_temp_sensor.h>
 #endif
+
+#define TEMP_NO_SENSOR (-32768) // sentinel cho lastTemp khi không có/ lỗi cảm biến
 
 // ================= BOARD DETECTION =================
 #define CHANNEL_2G_MIN 1
@@ -115,6 +124,7 @@ int nat_max_tcp = DEFAULT_NAPT_TCP;
 
 bool board_supports_5ghz = false;
 String board_model = "Unknown";
+bool hasTempSensor = false; // set thật ở setup(), sau khi thử init cảm biến
 
 // ================= NAT FUNCTIONS (esp_netif, ổn định giữa các bản SDK) =================
 void enableNAT() {
@@ -229,13 +239,18 @@ int validateNATTCP(int tcp) {
 }
 
 // ================= TEMPERATURE =================
+// FIX (fallback đa nền tảng): trả về NAN (thay vì 0.0f giả) khi chip không
+// có cảm biến, hoặc khi có cảm biến nhưng init/đọc thất bại. 0.0f trước
+// đây bị hiểu nhầm là "0°C thật" trên dashboard; NAN cho phép phân biệt
+// rõ "không có dữ liệu" và được xử lý riêng khi build gói JSON gửi ra.
 float getTemperature() {
-#ifdef CONFIG_IDF_TARGET_ESP32C5
-    return 0.0f;
-#else
+#if SOC_TEMP_SENSOR_SUPPORTED
+    if (!hasTempSensor) return NAN;
     float temp;
     if (temp_sensor_read_celsius(&temp) == ESP_OK) return temp;
-    return 0.0f;
+    return NAN;
+#else
+    return NAN;
 #endif
 }
 
@@ -348,7 +363,7 @@ let ws = new WebSocket('ws://' + location.hostname + '/ws');
 ws.onmessage = e => {
     let d = JSON.parse(e.data);
     document.getElementById('ram').innerText = Math.round(d.ram/1024);
-    document.getElementById('temp').innerText = d.temp;
+    document.getElementById('temp').innerText = (d.temp === null || d.temp === undefined) ? 'N/A' : d.temp;
     document.getElementById('net').innerText = d.internet ? 'ONLINE' : 'OFFLINE';
     document.getElementById('nat').innerText = d.nat ? 'ACTIVE' : 'OFF';
     document.getElementById('clientCount').innerText = d.clientCount;
@@ -472,7 +487,10 @@ void networkTask(void * pv) {
         }
 
         if (millis() - lastTempUpdate > TEMP_UPDATE_INTERVAL) {
-            lastTemp.store((int)(getTemperature() * 10));
+            float t = getTemperature();
+            // FIX: ép NAN sang int là undefined behavior -> dùng sentinel
+            // TEMP_NO_SENSOR để đánh dấu "không có dữ liệu nhiệt độ".
+            lastTemp.store(isnan(t) ? TEMP_NO_SENSOR : (int)(t * 10));
             lastTempUpdate = millis();
         }
 
@@ -482,7 +500,14 @@ void networkTask(void * pv) {
             doc["internet"] = internetOK.load();
             doc["nat"] = natEnabled.load();
             doc["rssi"] = lastRSSI.load();
-            doc["temp"] = lastTemp.load() / 10.0;
+            {
+                int rawTemp = lastTemp.load();
+                if (rawTemp == TEMP_NO_SENSOR) {
+                    doc["temp"] = nullptr; // FIX: fallback rõ ràng, không giả 0°C
+                } else {
+                    doc["temp"] = rawTemp / 10.0;
+                }
+            }
             doc["uptime"] = (millis() - uptimeStart) / 1000;
             doc["clientCount"] = currentClients.load();
             doc["clientLimit"] = max_clients;
@@ -564,11 +589,26 @@ void setup() {
         Serial.println("⚠️ CẢNH BÁO: đang dùng mật khẩu AP mặc định, hãy đổi ngay!");
     }
 
-#ifndef CONFIG_IDF_TARGET_ESP32C5
+    // FIX (fallback đa nền tảng): thử init cảm biến nhiệt độ thật sự và
+    // kiểm tra mã lỗi trả về, thay vì gọi rồi bỏ qua kết quả. Nếu chip
+    // không hỗ trợ (SOC_TEMP_SENSOR_SUPPORTED == 0) hoặc init/start thất
+    // bại vì bất kỳ lý do gì, hasTempSensor = false và toàn hệ thống
+    // (getTemperature(), JSON gửi ra, dashboard) tự động fallback về
+    // "N/A" một cách nhất quán.
+#if SOC_TEMP_SENSOR_SUPPORTED
     temp_sensor_config_t temp_sensor = TSENS_CONFIG_DEFAULT();
     temp_sensor.dac_offset = TSENS_DAC_L2;
-    temp_sensor_set_config(temp_sensor);
-    temp_sensor_start();
+    if (temp_sensor_set_config(temp_sensor) == ESP_OK &&
+        temp_sensor_start() == ESP_OK) {
+        hasTempSensor = true;
+        Serial.println("🌡️ Cảm biến nhiệt độ: OK");
+    } else {
+        hasTempSensor = false;
+        Serial.println("⚠️ Cảm biến nhiệt độ init thất bại - fallback N/A");
+    }
+#else
+    hasTempSensor = false;
+    Serial.println("⚠️ Chip này không có cảm biến nhiệt độ nội bộ - fallback N/A");
 #endif
 
     WiFi.mode(WIFI_AP_STA);
