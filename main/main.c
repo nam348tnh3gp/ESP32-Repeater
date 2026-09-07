@@ -16,12 +16,14 @@
 #include "esp_netif.h"
 #include "esp_chip_info.h"
 #include "esp_random.h"
+#include "esp_timer.h"
 #include "nvs_flash.h"
 #include "esp_task_wdt.h"
 #include "driver/gpio.h"
 
 #include "lwip/err.h"
 #include "lwip/sys.h"
+#include "lwip/tcpip.h"
 #include "lwip/netif.h"
 #include "lwip/priv/tcpip_priv.h"
 #include "lwip/etharp.h"
@@ -31,12 +33,17 @@
 #include "cJSON.h"
 
 // ================= NAT DECLARATIONS =================
-// FIX #(napt): ưu tiên header chính thức nếu SDK có sẵn, tránh sai chữ ký hàm
-#if __has_include("lwip/napt.h")
-  #include "lwip/napt.h"
+// FIX (napt v2): "lwip/napt.h" không tồn tại trên SDK này (đã rơi vào nhánh
+// fallback với chữ ký hàm SAI, gây lỗi biên dịch). API NAPT thật của
+// ESP-IDF/esp-lwip nằm ở "lwip/lwip_napt.h", với:
+//   - ip_napt_init(uint16_t max_nat, uint8_t max_portmap)
+//   - ip_napt_enable(uint32_t addr, int enable)  <- nhận địa chỉ IP dạng số
+//     nguyên (u32), KHÔNG phải ip4_addr_t/con trỏ.
+#if __has_include("lwip/lwip_napt.h")
+  #include "lwip/lwip_napt.h"
 #else
-extern void ip_napt_init(uint16_t max_slots, uint16_t max_tcp_ports);
-extern err_t ip_napt_enable(ip4_addr_t addr, int dir);
+extern void ip_napt_init(uint16_t max_nat, uint8_t max_portmap);
+extern void ip_napt_enable(uint32_t addr, int enable);
 extern void ip_napt_disable(void);
 #endif
 
@@ -95,13 +102,16 @@ static char sta_ssid[SSID_BUF_LEN] = {0};
 static char sta_pass[PASS_BUF_LEN] = {0};
 static char ap_ssid[SSID_BUF_LEN] = "APEX_ULTRA";
 static char ap_pass[PASS_BUF_LEN] = "12345678";
-static int ap_channel = AP_CHANNEL;
-static int max_clients = AP_MAX_CONN;
+// FIX: nvs_get_i32() yêu cầu chính xác kiểu int32_t* (trên toolchain này
+// int32_t là 'long', khác kiểu 'int' dù cùng 4 byte) -> khai báo int32_t
+// thay vì int để tránh lỗi "incompatible pointer type".
+static int32_t ap_channel = AP_CHANNEL;
+static int32_t max_clients = AP_MAX_CONN;
 
-static int nat_slots = NAT_MAX_SLOTS;
-static int nat_tcp = NAT_MAX_TCP;
+static int32_t nat_slots = NAT_MAX_SLOTS;
+static int32_t nat_tcp = NAT_MAX_TCP;
 
-static nvs_handle_t nvs_handle;
+static nvs_handle_t s_nvs_handle;
 
 // FIX #3: mutex bảo vệ ghi NVS + token phiên chống truy cập trái phép
 static SemaphoreHandle_t nvs_mutex;
@@ -195,13 +205,13 @@ static void url_decode(char *dst, size_t dst_size, const char *src) {
 
 static void save_config(void) {
     xSemaphoreTake(nvs_mutex, portMAX_DELAY);
-    nvs_set_str(nvs_handle, "ap_ssid", ap_ssid);
-    nvs_set_str(nvs_handle, "ap_pass", ap_pass);
-    nvs_set_i32(nvs_handle, "ap_channel", ap_channel);
-    nvs_set_i32(nvs_handle, "max_clients", max_clients);
-    nvs_set_i32(nvs_handle, "nat_slots", nat_slots);
-    nvs_set_i32(nvs_handle, "nat_tcp", nat_tcp);
-    nvs_commit(nvs_handle);
+    nvs_set_str(s_nvs_handle, "ap_ssid", ap_ssid);
+    nvs_set_str(s_nvs_handle, "ap_pass", ap_pass);
+    nvs_set_i32(s_nvs_handle, "ap_channel", ap_channel);
+    nvs_set_i32(s_nvs_handle, "max_clients", max_clients);
+    nvs_set_i32(s_nvs_handle, "nat_slots", nat_slots);
+    nvs_set_i32(s_nvs_handle, "nat_tcp", nat_tcp);
+    nvs_commit(s_nvs_handle);
     xSemaphoreGive(nvs_mutex);
 }
 
@@ -209,33 +219,33 @@ static void load_config(void) {
     size_t len;
 
     len = sizeof(ap_ssid);
-    if (nvs_get_str(nvs_handle, "ap_ssid", ap_ssid, &len) != ESP_OK) {
+    if (nvs_get_str(s_nvs_handle, "ap_ssid", ap_ssid, &len) != ESP_OK) {
         strncpy(ap_ssid, AP_SSID, sizeof(ap_ssid) - 1);
     }
 
     len = sizeof(ap_pass);
-    if (nvs_get_str(nvs_handle, "ap_pass", ap_pass, &len) != ESP_OK) {
+    if (nvs_get_str(s_nvs_handle, "ap_pass", ap_pass, &len) != ESP_OK) {
         strncpy(ap_pass, AP_PASS, sizeof(ap_pass) - 1);
     }
 
-    nvs_get_i32(nvs_handle, "ap_channel", &ap_channel);
+    nvs_get_i32(s_nvs_handle, "ap_channel", &ap_channel);
     if (ap_channel < 1 || ap_channel > 13) ap_channel = AP_CHANNEL;
 
-    nvs_get_i32(nvs_handle, "max_clients", &max_clients);
+    nvs_get_i32(s_nvs_handle, "max_clients", &max_clients);
     if (max_clients < 1 || max_clients > 10) max_clients = AP_MAX_CONN;
 
-    nvs_get_i32(nvs_handle, "nat_slots", &nat_slots);
+    nvs_get_i32(s_nvs_handle, "nat_slots", &nat_slots);
     if (nat_slots < 64 || nat_slots > 4096) nat_slots = NAT_MAX_SLOTS;
 
-    nvs_get_i32(nvs_handle, "nat_tcp", &nat_tcp);
+    nvs_get_i32(s_nvs_handle, "nat_tcp", &nat_tcp);
     if (nat_tcp < 32 || nat_tcp > 2048) nat_tcp = NAT_MAX_TCP;
     if (nat_slots < nat_tcp) nat_slots = nat_tcp;
 
     len = sizeof(sta_ssid);
-    nvs_get_str(nvs_handle, STA_SSID_CONF, sta_ssid, &len);
+    nvs_get_str(s_nvs_handle, STA_SSID_CONF, sta_ssid, &len);
 
     len = sizeof(sta_pass);
-    nvs_get_str(nvs_handle, STA_PASS_CONF, sta_pass, &len);
+    nvs_get_str(s_nvs_handle, STA_PASS_CONF, sta_pass, &len);
 
     sta_configured = (strlen(sta_ssid) > 0);
 }
@@ -247,15 +257,21 @@ static void enable_nat(void) {
     xSemaphoreGive(state_mutex);
     if (already) return;
 
+    // FIX: ip_napt_init() nhận (uint16_t max_nat, uint8_t max_portmap) - kẹp
+    // nat_tcp về phạm vi uint8_t (0-255) vì nó thực chất là kích thước bảng
+    // port-map, không phải "số cổng TCP" như tên biến gợi ý.
+    // ip_napt_enable() nhận địa chỉ IP dạng uint32_t (không phải ip4_addr_t
+    // hay con trỏ) - lấy qua ip4_addr_get_u32().
+    uint8_t portmap_size = (nat_tcp > 255) ? 255 : (uint8_t)nat_tcp;
     sys_lock_tcpip_core();
-    ip_napt_init(nat_slots, nat_tcp);
-    ip_napt_enable(ip_2_ip4(&netif_default->ip_addr), 1);
+    ip_napt_init((uint16_t)nat_slots, portmap_size);
+    ip_napt_enable(ip4_addr_get_u32(ip_2_ip4(&netif_default->ip_addr)), 1);
     sys_unlock_tcpip_core();
 
     xSemaphoreTake(state_mutex, portMAX_DELAY);
     nat_enabled = true;
     xSemaphoreGive(state_mutex);
-    ESP_LOGI(TAG, "NAT enabled (slots=%d, tcp=%d)", nat_slots, nat_tcp);
+    ESP_LOGI(TAG, "NAT enabled (slots=%d, tcp=%d)", (int)nat_slots, (int)nat_tcp);
 }
 
 static void disable_nat(void) {
@@ -292,19 +308,22 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
             ESP_LOGW(TAG, "STA retry exhausted, will retry again in background every %d s",
                      STA_RECONNECT_BACKOFF_MS / 1000);
         }
+        // FIX: mất uplink STA thì tắt NAT luôn (tránh forward vào interface
+        // đã chết), đồng thời khiến disable_nat() được sử dụng thật.
+        disable_nat();
         ESP_LOGI(TAG, "STA disconnected");
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_STACONNECTED) {
         xSemaphoreTake(state_mutex, portMAX_DELAY);
         current_clients++;
         int c = current_clients;
         xSemaphoreGive(state_mutex);
-        ESP_LOGI(TAG, "Client connected: %d/%d", c, max_clients);
+        ESP_LOGI(TAG, "Client connected: %d/%d", c, (int)max_clients);
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_STADISCONNECTED) {
         xSemaphoreTake(state_mutex, portMAX_DELAY);
         if (current_clients > 0) current_clients--;
         int c = current_clients;
         xSemaphoreGive(state_mutex);
-        ESP_LOGI(TAG, "Client disconnected: %d/%d", c, max_clients);
+        ESP_LOGI(TAG, "Client disconnected: %d/%d", c, (int)max_clients);
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
@@ -395,7 +414,7 @@ static void wifi_init(void) {
     }
 
     ESP_ERROR_CHECK(esp_wifi_start());
-    ESP_LOGI(TAG, "WiFi started. AP: %s on channel %d", ap_ssid, ap_channel);
+    ESP_LOGI(TAG, "WiFi started. AP: %s on channel %d", ap_ssid, (int)ap_channel);
 }
 
 // ================= AUTH / RATE LIMIT (FIX #3) =================
@@ -479,9 +498,9 @@ static esp_err_t save_sta_get_handler(httpd_req_t *req) {
 
     if (strlen(ssid) > 0) {
         xSemaphoreTake(nvs_mutex, portMAX_DELAY);
-        nvs_set_str(nvs_handle, STA_SSID_CONF, ssid);
-        nvs_set_str(nvs_handle, STA_PASS_CONF, pass);
-        nvs_commit(nvs_handle);
+        nvs_set_str(s_nvs_handle, STA_SSID_CONF, ssid);
+        nvs_set_str(s_nvs_handle, STA_PASS_CONF, pass);
+        nvs_commit(s_nvs_handle);
         xSemaphoreGive(nvs_mutex);
         ESP_LOGI(TAG, "Saved STA: %s", ssid);
     }
@@ -616,9 +635,11 @@ static void internet_check_task(void *pv) {
         if (nat_e) {
             struct netif *netif = netif_default;
             if (netif && netif_is_up(netif)) {
-                ip_addr_t dns_ip;
-                dns_getserver(0, &dns_ip);
-                ok = !ip_addr_isany(&dns_ip);
+                // FIX: dns_getserver() trên bản lwIP này chỉ nhận 1 tham số
+                // (chỉ số DNS server) và TRẢ VỀ con trỏ, không còn kiểu cũ
+                // "ghi ra tham số thứ 2" nữa.
+                const ip_addr_t *dns_ip = dns_getserver(0);
+                ok = (dns_ip != NULL) && !ip_addr_isany(dns_ip);
             } else {
                 ok = false;
             }
@@ -652,10 +673,10 @@ void app_main(void) {
     ESP_ERROR_CHECK(ret);
 
     // Open NVS
-    nvs_open("apex_v22", NVS_READWRITE, &nvs_handle);
+    nvs_open("apex_v22", NVS_READWRITE, &s_nvs_handle);
     load_config();
 
-    ESP_LOGI(TAG, "NAT: slots=%d, tcp=%d", nat_slots, nat_tcp);
+    ESP_LOGI(TAG, "NAT: slots=%d, tcp=%d", (int)nat_slots, (int)nat_tcp);
 
     // FIX #3: sinh token phiên bằng hardware RNG cho control-plane
     uint32_t r1 = esp_random(), r2 = esp_random();
