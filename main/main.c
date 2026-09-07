@@ -33,19 +33,14 @@
 #include "cJSON.h"
 
 // ================= NAT DECLARATIONS =================
-// FIX (napt v2): "lwip/napt.h" không tồn tại trên SDK này (đã rơi vào nhánh
-// fallback với chữ ký hàm SAI, gây lỗi biên dịch). API NAPT thật của
-// ESP-IDF/esp-lwip nằm ở "lwip/lwip_napt.h", với:
-//   - ip_napt_init(uint16_t max_nat, uint8_t max_portmap)
-//   - ip_napt_enable(uint32_t addr, int enable)  <- nhận địa chỉ IP dạng số
-//     nguyên (u32), KHÔNG phải ip4_addr_t/con trỏ.
-#if __has_include("lwip/lwip_napt.h")
-  #include "lwip/lwip_napt.h"
-#else
-extern void ip_napt_init(uint16_t max_nat, uint8_t max_portmap);
-extern void ip_napt_enable(uint32_t addr, int enable);
-extern void ip_napt_disable(void);
-#endif
+// FIX (napt v3): các hàm lwIP nội bộ ip_napt_init()/ip_napt_disable()/
+// sys_lock_tcpip_core() không còn là API công khai ổn định từ ESP-IDF v5.1+
+// (NAPT đã được tái cấu trúc, kích thước bảng NAT giờ lấy từ Kconfig thay vì
+// gọi ip_napt_init() thủ công). Cách được ESP-IDF khuyến nghị và ổn định
+// giữa các phiên bản là dùng API cấp cao esp_netif_napt_enable()/
+// esp_netif_napt_disable() trong "esp_netif.h" (đã include ở trên) - các
+// hàm này tự lo việc khóa TCP/IP core bên trong, không cần gọi
+// sys_lock_tcpip_core()/sys_unlock_tcpip_core() ở code ứng dụng nữa.
 
 // ================= DEFINES =================
 #define AP_SSID "APEX_ULTRA"
@@ -94,6 +89,7 @@ static httpd_handle_t server = NULL;
 // nhẹ thay vì đọc/ghi trực tiếp không đồng bộ.
 static SemaphoreHandle_t state_mutex;
 static bool nat_enabled = false;
+static esp_netif_t *s_ap_netif = NULL; // handle của AP netif, dùng cho esp_netif_napt_enable/disable
 static bool internet_ok = false;
 static int current_clients = 0;
 static int last_rssi = -100;
@@ -257,16 +253,21 @@ static void enable_nat(void) {
     xSemaphoreGive(state_mutex);
     if (already) return;
 
-    // FIX: ip_napt_init() nhận (uint16_t max_nat, uint8_t max_portmap) - kẹp
-    // nat_tcp về phạm vi uint8_t (0-255) vì nó thực chất là kích thước bảng
-    // port-map, không phải "số cổng TCP" như tên biến gợi ý.
-    // ip_napt_enable() nhận địa chỉ IP dạng uint32_t (không phải ip4_addr_t
-    // hay con trỏ) - lấy qua ip4_addr_get_u32().
-    uint8_t portmap_size = (nat_tcp > 255) ? 255 : (uint8_t)nat_tcp;
-    sys_lock_tcpip_core();
-    ip_napt_init((uint16_t)nat_slots, portmap_size);
-    ip_napt_enable(ip4_addr_get_u32(ip_2_ip4(&netif_default->ip_addr)), 1);
-    sys_unlock_tcpip_core();
+    // FIX (napt v3): dùng esp_netif_napt_enable() thay vì gọi thẳng
+    // ip_napt_init()/ip_napt_enable() của lwIP - kích thước bảng NAT/portmap
+    // (nat_slots/nat_tcp) giờ được cấu hình qua Kconfig
+    // (CONFIG_LWIP_NAT_MAX / CONFIG_LWIP_NAT_PORTMAP_MAX trong sdkconfig),
+    // không còn truyền runtime được nữa - nat_slots/nat_tcp chỉ còn dùng để
+    // log lại giá trị cấu hình mong muốn.
+    if (s_ap_netif == NULL) {
+        ESP_LOGE(TAG, "enable_nat: AP netif chưa được khởi tạo");
+        return;
+    }
+    esp_err_t err = esp_netif_napt_enable(s_ap_netif);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_netif_napt_enable failed: %s", esp_err_to_name(err));
+        return;
+    }
 
     xSemaphoreTake(state_mutex, portMAX_DELAY);
     nat_enabled = true;
@@ -280,9 +281,12 @@ static void disable_nat(void) {
     xSemaphoreGive(state_mutex);
     if (!was_enabled) return;
 
-    sys_lock_tcpip_core();
-    ip_napt_disable();
-    sys_unlock_tcpip_core();
+    if (s_ap_netif != NULL) {
+        esp_err_t err = esp_netif_napt_disable(s_ap_netif);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "esp_netif_napt_disable failed: %s", esp_err_to_name(err));
+        }
+    }
 
     xSemaphoreTake(state_mutex, portMAX_DELAY);
     nat_enabled = false;
@@ -356,7 +360,7 @@ static void wifi_init(void) {
 
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_ap();
+    s_ap_netif = esp_netif_create_default_wifi_ap();
     esp_netif_create_default_wifi_sta();
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
