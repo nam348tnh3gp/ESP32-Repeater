@@ -142,6 +142,7 @@ static const char *index_html_tmpl =
 "<div>Uplink: <span id='staStatus'>WAIT</span></div>"
 "<div>Signal: <b id='rssi'>-</b> dBm</div>"
 "<div>Clients: <b id='clientCount'>0</b> / <b id='clientLimit'>7</b></div>"
+"<div id='ctable' style='font-size:12px;margin-top:6px;'>-</div>"
 "<div id='weakWarn' class='warning' style='display:none;'>⚠️ Đang dùng mật khẩu AP mặc định — hãy đổi ngay!</div>"
 "<div id='pollErr' class='msg err' style='display:none;'>⚠️ Mất kết nối tới thiết bị — đang thử lại...</div>"
 "</div>"
@@ -189,6 +190,12 @@ static const char *index_html_tmpl =
 "document.getElementById('weakWarn').style.display=d.weakPassword?'block':'none';"
 "}).catch(()=>{pollFailed++;if(pollFailed>=2)document.getElementById('pollErr').style.display='block';});}"
 "setInterval(fetchData,2000);fetchData();"
+"function fetchClients(){fetch('/api/clients').then(r=>r.json()).then(list=>{"
+"const el=document.getElementById('ctable');"
+"if(!list.length){el.innerHTML='<i>No clients</i>';return;}"
+"el.innerHTML=list.map(c=>`<div>• ${c.ip} <small>[${c.mac}]</small></div>`).join('');"
+"}).catch(()=>{});}"
+"setInterval(fetchClients,5000);fetchClients();"
 "function loadConfig(){fetch('/api/config').then(r=>r.json()).then(c=>{"
 "document.getElementById('apSsidInp').value=c.apSsid;"
 "if(c.staSsid){document.getElementById('staSsidInp').value=c.staSsid;}"
@@ -574,6 +581,44 @@ static esp_err_t config_get_handler(httpd_req_t *req) {
     return httpd_resp_send(req, buffer, strlen(buffer));
 }
 
+// FIX (port từ ESP_Code.ino): danh sách client kèm MAC + IP thay vì chỉ đếm
+// số lượng. Dùng API chính thức esp_netif_dhcps_get_clients_by_mac() của
+// ESP-IDF (esp_netif.h) - không đụng vào bảng ARP/DHCP lease nội bộ của
+// lwIP như getIPFromMAC() bên .ino, nên ổn định hơn giữa các phiên bản.
+static esp_err_t clients_get_handler(httpd_req_t *req) {
+    wifi_sta_list_t sta_list;
+    if (esp_wifi_ap_get_sta_list(&sta_list) != ESP_OK || s_ap_netif == NULL) {
+        httpd_resp_set_type(req, "application/json");
+        return httpd_resp_send(req, "[]", HTTPD_RESP_USE_STRLEN);
+    }
+
+    int num = sta_list.num;
+    if (num > 10) num = 10; // giới hạn để buffer JSON không phình quá lớn
+
+    esp_netif_pair_mac_ip_t pairs[10] = {0};
+    for (int i = 0; i < num; i++) {
+        memcpy(pairs[i].mac, sta_list.sta[i].mac, 6);
+    }
+    esp_netif_dhcps_get_clients_by_mac(s_ap_netif, num, pairs);
+
+    char buffer[10 * 48 + 4];
+    int off = 0;
+    buffer[off++] = '[';
+    for (int i = 0; i < num; i++) {
+        off += snprintf(buffer + off, sizeof(buffer) - off,
+            "%s{\"mac\":\"%02X:%02X:%02X:%02X:%02X:%02X\",\"ip\":\"" IPSTR "\"}",
+            (i > 0) ? "," : "",
+            pairs[i].mac[0], pairs[i].mac[1], pairs[i].mac[2],
+            pairs[i].mac[3], pairs[i].mac[4], pairs[i].mac[5],
+            IP2STR(&pairs[i].ip));
+    }
+    buffer[off++] = ']';
+    buffer[off] = '\0';
+
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(req, buffer, off);
+}
+
 static esp_err_t save_sta_get_handler(httpd_req_t *req) {
     char query[QUERY_VALUE_LEN * 3];
     if (!read_post_body(req, query, sizeof(query))) return ESP_OK;
@@ -690,6 +735,12 @@ static const httpd_uri_t config_uri = {
     .handler = config_get_handler,
 };
 
+static const httpd_uri_t clients_uri = {
+    .uri = "/api/clients",
+    .method = HTTP_GET,
+    .handler = clients_get_handler,
+};
+
 static const httpd_uri_t save_sta_uri = {
     .uri = "/save-sta",
     .method = HTTP_POST,
@@ -711,13 +762,14 @@ static const httpd_uri_t save_nat_uri = {
 static void start_webserver(void) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.lru_purge_enable = true;
-    config.max_uri_handlers = 9;
+    config.max_uri_handlers = 10;
 
     if (httpd_start(&server, &config) == ESP_OK) {
         httpd_register_uri_handler(server, &root_uri);
         httpd_register_uri_handler(server, &token_uri);
         httpd_register_uri_handler(server, &status_uri);
         httpd_register_uri_handler(server, &config_uri);
+        httpd_register_uri_handler(server, &clients_uri);
         httpd_register_uri_handler(server, &save_sta_uri);
         httpd_register_uri_handler(server, &save_ap_uri);
         httpd_register_uri_handler(server, &save_nat_uri);
