@@ -97,6 +97,13 @@ static nvs_handle_t s_nvs_handle;
 static SemaphoreHandle_t nvs_mutex;
 static SemaphoreHandle_t rate_limit_mutex;
 static SemaphoreHandle_t sta_state_mutex;  // Bảo vệ sta_disconnected, s_retry_num
+// FIX (race no-internet): đánh thức internet_check_task ngay khi STA vừa có
+// IP, thay vì để nó chờ hết chu kỳ 60s. Nếu không có fix này, một điện thoại
+// join AP ngay sau khi ESP32 vừa lên mạng sẽ nhận captive-check trả lời
+// "chưa có internet" (vì internet_ok vẫn còn false), hệ điều hành sẽ CACHE
+// lại kết luận "no internet" đó và không tự kiểm tra lại - dù vài giây sau
+// dashboard đã hiện online thật.
+static SemaphoreHandle_t internet_check_trigger;
 static char session_token[24] = {0};
 static unsigned long last_config_window_ms = 0;
 static int config_request_count = 0;       // protected by rate_limit_mutex
@@ -647,6 +654,11 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         xSemaphoreGive(sta_state_mutex);
         xEventGroupClearBits(wifi_event_group, WIFI_FAIL_BIT);
         xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
+        // FIX (race no-internet): vừa có IP thì đánh thức internet_check_task
+        // kiểm tra NGAY, không chờ chu kỳ định kỳ tiếp theo.
+        if (internet_check_trigger != NULL) {
+            xSemaphoreGive(internet_check_trigger);
+        }
     }
 }
 
@@ -1174,7 +1186,14 @@ static void internet_check_task(void *pv) {
             ESP_LOGI(TAG, "❌ Internet: OFFLINE (STA=%d, Reachable=%d)", sta_connected, internet_reachable);
         }
 
-        vTaskDelay(pdMS_TO_TICKS(60000));  // Kiểm tra mỗi 60 giây
+        // FIX (race no-internet): chờ tối đa 10s (thay vì cứng 60s), NHƯNG
+        // sẽ được đánh thức NGAY nếu có sự kiện STA vừa có IP
+        // (xSemaphoreGive trong wifi_event_handler). Điều này thu hẹp tối đa
+        // cửa sổ mà DNS captive task còn trả lời "chưa có internet" cho các
+        // domain kiểm tra captive-portal của điện thoại/hệ điều hành ngay
+        // sau khi vừa kết nối - đây là nguyên nhân khiến hệ điều hành ghi
+        // nhận "no internet" dù ngay sau đó dashboard đã báo online.
+        xSemaphoreTake(internet_check_trigger, pdMS_TO_TICKS(10000));
     }
 }
 
@@ -1202,6 +1221,13 @@ void app_main(void) {
     sta_state_mutex = xSemaphoreCreateMutex();
     if (sta_state_mutex == NULL) {
         ESP_LOGE(TAG, "Failed to create sta_state_mutex");
+        abort();
+    }
+    // FIX (race no-internet): binary semaphore, bắt đầu ở trạng thái "rỗng"
+    // (chưa give) - internet_check_task sẽ tự chờ tối đa 10s ở lần đầu.
+    internet_check_trigger = xSemaphoreCreateBinary();
+    if (internet_check_trigger == NULL) {
+        ESP_LOGE(TAG, "Failed to create internet_check_trigger");
         abort();
     }
 
