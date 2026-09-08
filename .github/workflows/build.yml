@@ -86,24 +86,24 @@ jobs:
           arduino-cli core install esp32:esp32 \
             --additional-urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
 
+      - name: Update library index
+        run: arduino-cli lib update-index
+
       - name: Install libraries from requirements.arduino
         run: |
-          if [ ! -f requirements.arduino ]; then
-            echo "❌ requirements.arduino not found! Creating default..."
-            cat > requirements.arduino <<EOF
-          ESPAsyncWebServer@3.2.0
-          AsyncTCP@1.1.4
-          ArduinoJson@7.4.3
-          EOF
-          fi
+          # Bật chế độ cài từ git (cần thiết cho --git-url)
+          arduino-cli config set library.enable_unsafe_install true
+
           while IFS= read -r line; do
             # Bỏ qua dòng trống và comment
             [[ -z "$line" || "$line" =~ ^# ]] && continue
-            # Tách tên@phiên bản (bỏ qua phần chú thích sau #)
-            lib=$(echo "$line" | awk '{print $1}')
-            if [[ -n "$lib" ]]; then
-              echo "Installing $lib ..."
-              arduino-cli lib install "$lib"
+            # Tách tên thư viện và URL Git
+            lib_name=$(echo "$line" | awk '{print $1}')
+            git_url=$(echo "$line" | awk '{print $2}')
+            
+            if [[ -n "$lib_name" && -n "$git_url" ]]; then
+              echo "Installing $lib_name from $git_url ..."
+              arduino-cli lib install --git-url "$git_url"
             fi
           done < requirements.arduino
 
