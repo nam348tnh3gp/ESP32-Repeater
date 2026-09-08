@@ -35,10 +35,6 @@
 #include <lwip/netdb.h>
 #include <lwip/inet.h>
 
-#ifndef CONFIG_IDF_TARGET_ESP32C5
-#include <esp_temp_sensor.h>
-#endif
-
 // ================= BOARD DETECTION =================
 #define CHANNEL_2G_MIN 1
 #define CHANNEL_2G_MAX 13
@@ -56,7 +52,6 @@
 #define MEM_CRITICAL_THRESHOLD 26000
 #define WATCHDOG_TIMEOUT 45
 #define DEFAULT_MAX_CLIENTS 7
-#define TEMP_UPDATE_INTERVAL 5000
 
 #define DEFAULT_AP_CHANNEL 1
 #define DEFAULT_AP_HIDDEN 0
@@ -82,7 +77,7 @@ String sta_ssid, sta_pass, ap_ssid, ap_pass;
 std::atomic<bool> internetOK{false};
 std::atomic<bool> internetReachable{false};
 std::atomic<bool> natEnabled{false};
-std::atomic<int> lastRSSI{-100}, lastTemp{0};
+std::atomic<int> lastRSSI{-100};
 std::atomic<int> currentClients{0};
 unsigned long uptimeStart = 0;
 
@@ -427,17 +422,6 @@ int validateNATTCP(int tcp) {
     return tcp;
 }
 
-// ================= TEMPERATURE =================
-float getTemperature() {
-#ifdef CONFIG_IDF_TARGET_ESP32C5
-    return 0.0f;
-#else
-    float temp;
-    if (temp_sensor_read_celsius(&temp) == ESP_OK) return temp;
-    return 0.0f;
-#endif
-}
-
 // ================= WIFI EVENT HANDLER (port từ main.c: retry + IP_EVENT) =================
 void wifiEventHandler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
@@ -635,11 +619,10 @@ bindForm('natForm','natMsg',true);
 </script></body></html>
 )rawliteral";
 
-// ================= NETWORK TASK (chỉ còn broadcast + client list + temp) =================
+// ================= NETWORK TASK (chỉ còn broadcast + client list) =================
 void networkTask(void * pv) {
     esp_task_wdt_add(nullptr);
     static uint32_t lastBroadcast = 0;
-    static unsigned long lastTempUpdate = 0;
 
     for (;;) {
         esp_task_wdt_reset();
@@ -651,11 +634,6 @@ void networkTask(void * pv) {
         }
 
         lastRSSI.store((WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : -100);
-
-        if (millis() - lastTempUpdate > TEMP_UPDATE_INTERVAL) {
-            lastTemp.store((int)(getTemperature() * 10));
-            lastTempUpdate = millis();
-        }
 
         if (millis() - lastBroadcast > 2000) {
             JsonDocument doc;
@@ -750,13 +728,6 @@ void setup() {
     if (ap_pass == "12345678") {
         Serial.println("⚠️ CẢNH BÁO: đang dùng mật khẩu AP mặc định, hãy đổi ngay!");
     }
-
-#ifndef CONFIG_IDF_TARGET_ESP32C5
-    temp_sensor_config_t temp_sensor = TSENS_CONFIG_DEFAULT();
-    temp_sensor.dac_offset = TSENS_DAC_L2;
-    temp_sensor_set_config(temp_sensor);
-    temp_sensor_start();
-#endif
 
     WiFi.mode(WIFI_AP_STA);
     WiFi.softAPConfig(AP_IP, AP_GATEWAY, AP_SUBNET);
