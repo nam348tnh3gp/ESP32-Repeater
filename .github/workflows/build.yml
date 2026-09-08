@@ -11,6 +11,7 @@ permissions:
   contents: read
 
 jobs:
+  # Job 1: Build ESP-IDF (main.c) bằng PlatformIO
   build-espidf:
     runs-on: ubuntu-latest
 
@@ -23,10 +24,6 @@ jobs:
         with:
           python-version: '3.x'
           cache: 'pip'
-          # FIX: cache: 'pip' cần 1 file để tính cache key (mặc định tìm
-          # requirements.txt/pyproject.toml) - repo không có nên bước này
-          # lỗi "No file ... matched". Trỏ thẳng vào requirements.txt vừa
-          # thêm ở root repo.
           cache-dependency-path: requirements.txt
 
       - name: Install PlatformIO & esptool
@@ -68,12 +65,7 @@ jobs:
           ls -lh .pio/build/esp32dev/merged.bin
           echo "✅ Build and merge successful!"
 
-  # FIX: job mới - build ESP_Code.ino bằng arduino-cli (không dùng PlatformIO),
-  # để kiểm tra file .ino build được trên đúng công cụ Arduino IDE CLI thật,
-  # thay vì chỉ đoán qua đọc code.
-  # "needs: build-espidf" bắt job này CHỜ job build-espidf chạy xong (thành
-  # công) rồi mới bắt đầu, thay vì chạy song song như mặc định của GitHub
-  # Actions - đúng theo yêu cầu build tuần tự, không chạy cùng lúc.
+  # Job 2: Build Arduino (ESP_Code.ino) bằng arduino-cli, sử dụng requirements.arduino
   build-arduino-ino:
     needs: build-espidf
     runs-on: ubuntu-latest
@@ -94,15 +86,28 @@ jobs:
           arduino-cli core install esp32:esp32 \
             --additional-urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
 
-      - name: Install required libraries
+      - name: Install libraries from requirements.arduino
         run: |
-          arduino-cli lib install "ESPAsyncWebServer"
-          arduino-cli lib install "AsyncTCP"
-          arduino-cli lib install "ArduinoJson"
+          if [ ! -f requirements.arduino ]; then
+            echo "❌ requirements.arduino not found! Creating default..."
+            cat > requirements.arduino <<EOF
+          ESPAsyncWebServer@3.2.0
+          AsyncTCP@1.1.4
+          ArduinoJson@7.4.3
+          EOF
+          fi
+          while IFS= read -r line; do
+            # Bỏ qua dòng trống và comment
+            [[ -z "$line" || "$line" =~ ^# ]] && continue
+            # Tách tên@phiên bản (bỏ qua phần chú thích sau #)
+            lib=$(echo "$line" | awk '{print $1}')
+            if [[ -n "$lib" ]]; then
+              echo "Installing $lib ..."
+              arduino-cli lib install "$lib"
+            fi
+          done < requirements.arduino
 
-      # arduino-cli yêu cầu file .ino nằm trong thư mục TRÙNG TÊN với chính
-      # nó (ví dụ ESP_Code.ino phải nằm trong thư mục ESP_Code/) - repo hiện
-      # để file .ino thẳng ở root nên cần copy vào đúng cấu trúc trước.
+      # arduino-cli yêu cầu file .ino nằm trong thư mục trùng tên
       - name: Prepare sketch folder
         run: |
           mkdir -p build_sketch/ESP_Code
