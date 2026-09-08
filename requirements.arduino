@@ -6,5 +6,5 @@
 ArduinoJson@7.4.3
 
 # Các thư viện chỉ có trên GitHub
-ESPAsyncWebServer https://github.com/ESP32Async/ESPAsyncWebServer.git#v3.7.10
+ESPAsyncWebServer https://github.com/ESP32Async/ESPAsyncWebServer.git#v3.12.0
 AsyncTCP https://github.com/ESP32Async/AsyncTCP.git#v3.3.3
