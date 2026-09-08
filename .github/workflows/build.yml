@@ -66,7 +66,11 @@ jobs:
   # FIX: job mới - build ESP_Code.ino bằng arduino-cli (không dùng PlatformIO),
   # để kiểm tra file .ino build được trên đúng công cụ Arduino IDE CLI thật,
   # thay vì chỉ đoán qua đọc code.
+  # "needs: build-espidf" bắt job này CHỜ job build-espidf chạy xong (thành
+  # công) rồi mới bắt đầu, thay vì chạy song song như mặc định của GitHub
+  # Actions - đúng theo yêu cầu build tuần tự, không chạy cùng lúc.
   build-arduino-ino:
+    needs: build-espidf
     runs-on: ubuntu-latest
 
     steps:
