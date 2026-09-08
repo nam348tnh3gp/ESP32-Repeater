@@ -89,57 +89,39 @@ jobs:
       - name: Update library index
         run: arduino-cli lib update-index
 
-      - name: Debug requirements.arduino content
-        run: |
-          echo "📄 Raw content of requirements.arduino:"
-          cat -A requirements.arduino
-          echo ""
-          echo "📊 Line count:"
-          wc -l requirements.arduino
-          echo ""
-          echo "🔍 Parsing each line:"
-          while IFS= read -r line; do
-            [[ -z "$line" ]] && echo "  → Empty line"
-            [[ "$line" =~ ^# ]] && echo "  → Comment: $line"
-          done < requirements.arduino
-
       - name: Install libraries from requirements.arduino (Hybrid - Fixed)
         run: |
           # Bật chế độ cài từ git
           arduino-cli config set library.enable_unsafe_install true
 
-          # Đọc từng dòng và xử lý
-          while IFS= read -r line; do
-            # Bỏ qua dòng trống và comment
-            [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
-            
-            # Trim khoảng trắng đầu và cuối dòng
+          # Lọc bỏ dòng comment (#) và dòng trống, sau đó xử lý từng dòng
+          grep -vE '^[[:space:]]*#|^[[:space:]]*$' requirements.arduino | while IFS= read -r line; do
+            # Trim khoảng trắng đầu/cuối
             line_trimmed=$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
             [[ -z "$line_trimmed" ]] && continue
-            
+
             # Tách field1 và field2
             field1=$(echo "$line_trimmed" | awk '{print $1}')
             field2=$(echo "$line_trimmed" | awk '{print $2}')
-            
-            echo "🔧 Processing: field1='$field1', field2='$field2'"
-            
-            # Kiểm tra xem dòng có chứa URL (http/https) không
+
+            echo "🔧 Processing: '$field1' - '$field2'"
+
             if [[ -n "$field2" && "$field2" =~ ^https?:// ]]; then
-              # Đây là Git URL - cài từ GitHub
-              echo "📦 Installing $field1 from Git: $field2 ..."
+              # Cài từ Git
+              echo "📦 Installing $field1 from Git: $field2"
               arduino-cli lib install --git-url "$field2"
             elif [[ -n "$field1" ]]; then
-              # Đây là tên@phiên bản - cài từ Library Manager
-              echo "📦 Installing $field1 from Library Manager ..."
+              # Cài từ Library Manager
+              echo "📦 Installing $field1 from Library Manager"
               arduino-cli lib install "$field1"
             else
               echo "⚠️ Skipping invalid line: $line_trimmed"
             fi
-          done < requirements.arduino
+          done
 
       - name: Verify installed libraries
         run: |
-          echo "📚 Installed libraries in Arduino/libraries:"
+          echo "📚 Installed libraries:"
           ls -la ~/Arduino/libraries/ | grep -E "AsyncTCP|ESPAsyncWebServer|ArduinoJson" || echo "⚠️ Some libraries not found!"
 
       - name: Prepare sketch folder
