@@ -1,50 +1,43 @@
 /*
-   ESP32 NAT ROUTER - V22.2.0 (FIXED, ported từ main.c đã build thành công)
-   - Các lỗi đã vá (kế thừa từ V22.1.0):
-     1) Watchdog không được reset trong loop() -> thiết bị tự reboot mỗi 45s
-     2) Không có xác thực cho các route đổi cấu hình (save-sta/save-ap/save-nat)
-     3) urlDecode() bị gọi 2 lần trên mật khẩu đã được decode sẵn -> sai mật khẩu
-     4) urlDecode() dùng biến chưa khởi tạo khi sscanf thất bại
-     5) handleScan() block AsyncTCP task tới 8 giây -> đứng cả dashboard
-     8) Không cảnh báo khi còn dùng mật khẩu AP mặc định yếu
-     9) Ghi NVS (Preferences) không có mutex bảo vệ giữa các request đồng thời
-   - MỚI trong V22.2.0 (port từ main.c sau khi build thật thành công):
-     6+7) Bỏ hẳn ip_napt_init()/ip_napt_enable()/ip_napt_disable() +
-          sys_lock_tcpip_core()/sys_unlock_tcpip_core() - đây là API nội bộ
-          của lwIP, chữ ký thay đổi giữa các phiên bản SDK và đã gây lỗi biên
-          dịch thật (implicit declaration / incompatible pointer type) khi
-          build main.c. Chuyển sang esp_netif_napt_enable()/
-          esp_netif_napt_disable() - API công khai, ổn định của esp_netif.h.
-     10) getIPFromMAC() cũ tự đọc bảng arp_table nội bộ của lwIP (không có
-         trong header công khai của Arduino core, rủi ro không compile được
-         hoặc không link được). Thay bằng esp_netif_dhcps_get_clients_by_mac()
-         - API DHCP server chính thức, lấy đúng IP đã cấp cho từng MAC.
+   ESP32 NAT ROUTER - V22.3.0 (FIXED, đồng bộ đầy đủ với main.c mới nhất)
+   Kế thừa toàn bộ fix từ V22.2.0, PORT THÊM từ main.c:
+     - DNS captive-portal thông minh: forward thật lên 8.8.8.8 khi có internet,
+       chỉ spoof domain kiểm tra captive-portal khi CHƯA có internet.
+     - HTTP handler bắt các domain kiểm tra captive-portal
+       (generate_204, hotspot-detect.html, ncsi.txt, success, ...).
+     - perform_internet_check() qua HTTP GET thật (generate_204) thay vì chỉ
+       connect TCP thô tới 1.1.1.1:53 (không phản ánh đúng internet thật).
+     - FIX race "no internet": semaphore đánh thức kiểm tra internet NGAY khi
+       STA vừa có IP, thay vì chờ hết chu kỳ định kỳ - đây là nguyên nhân
+       khiến điện thoại cache nhầm "no internet" dù dashboard báo online.
+     - STA retry/reconnect nền đầy đủ (s_retry_num, sta_disconnected,
+       sta_reconnect_task) - trước đây .ino chỉ gọi WiFi.begin() 1 lần.
+     - Form Save chuyển sang POST + AJAX (không reload trang), có prefill
+       cấu hình hiện tại (/api/config), /api/clients tách riêng.
+     - NAT giờ chỉ bật khi THẬT SỰ có internet (không chỉ WiFi.status()==
+       WL_CONNECTED), khớp đúng logic main.c.
 */
 
 #include <Arduino.h>
-#include <DNSServer.h>
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
+#include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
 #include <esp_task_wdt.h>
 #include <esp_wifi.h>
 #include <esp_netif.h>
 #include <esp_chip_info.h>
+#include <esp_random.h>
 #include <atomic>
-#include <math.h>
-#include "soc/soc_caps.h"
 
-// FIX (fallback đa nền tảng): dùng macro capability chuẩn của ESP-IDF
-// (SOC_TEMP_SENSOR_SUPPORTED, định nghĩa trong soc_caps.h) thay vì loại
-// trừ cứng theo tên chip (CONFIG_IDF_TARGET_ESP32C5). Macro này tự động
-// đúng cho MỌI chip hiện tại và tương lai không có cảm biến nhiệt độ nội
-// bộ (không chỉ riêng C5), nên không cần sửa code mỗi khi có chip mới.
-#if SOC_TEMP_SENSOR_SUPPORTED
+#include <lwip/sockets.h>
+#include <lwip/netdb.h>
+#include <lwip/inet.h>
+
+#ifndef CONFIG_IDF_TARGET_ESP32C5
 #include <esp_temp_sensor.h>
 #endif
-
-#define TEMP_NO_SENSOR (-32768) // sentinel cho lastTemp khi không có/ lỗi cảm biến
 
 // ================= BOARD DETECTION =================
 #define CHANNEL_2G_MIN 1
@@ -62,7 +55,6 @@
 #define DEFAULT_NAPT_TCP   256
 #define MEM_CRITICAL_THRESHOLD 26000
 #define WATCHDOG_TIMEOUT 45
-#define MAX_SCAN_NETWORKS 10
 #define DEFAULT_MAX_CLIENTS 7
 #define TEMP_UPDATE_INTERVAL 5000
 
@@ -72,26 +64,25 @@
 #define MIN_CLIENTS 1
 #define MAX_CLIENTS_LIMIT 10
 
-#define DNS_MODE_CAPTIVE 0
-#define DNS_MODE_NORMAL 1
-#define DEFAULT_DNS_MODE DNS_MODE_CAPTIVE
-
 #define CONFIG_RATE_WINDOW_MS 5000
 #define CONFIG_RATE_MAX_REQ   3
+
+#define STA_MAX_RETRY 5
+#define STA_RECONNECT_BACKOFF_MS 30000
 
 IPAddress AP_IP(192, 168, 4, 1);
 IPAddress AP_GATEWAY(192, 168, 4, 1);
 IPAddress AP_SUBNET(255, 255, 255, 0);
 
-DNSServer dns;
 AsyncWebServer server(80);
 AsyncWebSocket ws("/ws");
 Preferences prefs;
 
 String sta_ssid, sta_pass, ap_ssid, ap_pass;
-std::atomic<bool> internetOK{false}, natEnabled{false};
+std::atomic<bool> internetOK{false};
+std::atomic<bool> internetReachable{false};
+std::atomic<bool> natEnabled{false};
 std::atomic<int> lastRSSI{-100}, lastTemp{0};
-std::atomic<bool> scanInProgress{false};
 std::atomic<int> currentClients{0};
 unsigned long uptimeStart = 0;
 
@@ -100,46 +91,66 @@ unsigned long lastConfigRequestWindow = 0;
 int configRequestCount = 0;
 
 SemaphoreHandle_t prefsMutex = nullptr;
+SemaphoreHandle_t staStateMutex = nullptr;
 
-volatile bool scanReady = false;
-String scanResultJson = "[]";
+// FIX (race no-internet, port từ main.c): đánh thức internetCheckTask ngay
+// khi STA vừa có IP, thay vì để nó chờ hết chu kỳ. Nếu không có fix này,
+// điện thoại join AP ngay sau khi ESP32 vừa lên mạng sẽ nhận captive-check
+// trả lời "chưa có internet" và HĐH sẽ CACHE lại kết luận đó, không tự kiểm
+// tra lại - dù vài giây sau dashboard đã báo online thật.
+SemaphoreHandle_t internetCheckTrigger = nullptr;
 
-// FIX (napt v2, port từ main.c): handle esp_netif của AP, dùng cho
-// esp_netif_napt_enable()/disable() và esp_netif_dhcps_get_clients_by_mac().
+EventGroupHandle_t wifiEventGroup = nullptr;
+#define WIFI_CONNECTED_BIT BIT0
+#define WIFI_FAIL_BIT BIT1
+static int s_retry_num = 0;              // bảo vệ bởi staStateMutex
+static bool sta_configured = false;
+static bool sta_disconnected = true;     // bảo vệ bởi staStateMutex
+
 static esp_netif_t *s_ap_netif = nullptr;
+
+// ================= CAPTIVE PORTAL DOMAINS (port từ main.c) =================
+static const char* captive_domains[] = {
+    "connectivitycheck.gstatic.com",
+    "connectivitycheck.android.com",
+    "detectportal.firefox.com",
+    "www.msftncsi.com",
+    "captive.apple.com",
+    "www.apple.com",
+    "clients3.google.com",
+    "nmcheck.gnome.org",
+    "www.google.com",
+    NULL
+};
 
 int ap_channel = DEFAULT_AP_CHANNEL;
 bool ap_hidden = DEFAULT_AP_HIDDEN;
 int max_clients = DEFAULT_MAX_CLIENTS;
-int dns_mode = DEFAULT_DNS_MODE;
 bool use_5ghz = DEFAULT_BAND_5GHZ;
 
-// nat_max_slots/nat_max_tcp: từ V22.2.0 trở đi, kích thước bảng NAT thật sự
-// được quyết định bởi Kconfig của SDK (CONFIG_LWIP_NAT_MAX /
-// CONFIG_LWIP_NAT_PORTMAP_MAX), không còn set runtime qua ip_napt_init()
-// được nữa. Hai biến này chỉ còn để hiển thị/lưu lại giá trị người dùng
-// mong muốn trên dashboard, không ảnh hưởng hành vi NAT thật.
+// nat_max_slots/nat_max_tcp: chỉ để hiển thị/lưu lại - kích thước bảng NAT
+// thật do Kconfig của SDK quyết định (xem ghi chú V22.2.0).
 int nat_max_slots = DEFAULT_NAPT_SLOTS;
 int nat_max_tcp = DEFAULT_NAPT_TCP;
 
 bool board_supports_5ghz = false;
 String board_model = "Unknown";
-bool hasTempSensor = false; // set thật ở setup(), sau khi thử init cảm biến
 
-// ================= NAT FUNCTIONS (esp_netif, ổn định giữa các bản SDK) =================
-void enableNAT() {
-    if (WiFi.status() != WL_CONNECTED || natEnabled.load()) return;
+// ================= NAT FUNCTIONS (esp_netif) =================
+bool enableNAT() {
+    if (natEnabled.load()) return true;
     if (s_ap_netif == nullptr) {
         Serial.println("❌ enableNAT: AP netif chưa sẵn sàng");
-        return;
+        return false;
     }
     esp_err_t err = esp_netif_napt_enable(s_ap_netif);
     if (err == ESP_OK) {
         natEnabled.store(true);
-        Serial.printf("✅ NAT Enabled (slots=%d, tcp=%d - theo Kconfig của SDK)\n", nat_max_slots, nat_max_tcp);
-    } else {
-        Serial.printf("❌ Failed to enable NAT: %s\n", esp_err_to_name(err));
+        Serial.printf("✅ NAT Enabled (slots=%d, tcp=%d)\n", nat_max_slots, nat_max_tcp);
+        return true;
     }
+    Serial.printf("❌ Failed to enable NAT: %s\n", esp_err_to_name(err));
+    return false;
 }
 
 void disableNAT() {
@@ -152,6 +163,189 @@ void disableNAT() {
     }
     natEnabled.store(false);
     Serial.println("⚠️ NAT Disabled");
+}
+
+// ================= HÀM KIỂM TRA INTERNET (port từ main.c) =================
+bool isInternetAvailable() {
+    return internetOK.load();
+}
+
+// FIX (port từ main.c): kiểm tra internet bằng HTTP GET thật (generate_204)
+// thay vì chỉ connect TCP thô tới 1.1.1.1:53 - phản ánh đúng khả năng
+// duyệt web thật, không chỉ "cổng 53 có mở hay không".
+bool performInternetCheck() {
+    HTTPClient http;
+    http.setConnectTimeout(5000);
+    http.setTimeout(5000);
+    if (!http.begin("http://connectivitycheck.gstatic.com/generate_204")) return false;
+    int code = http.GET();
+    http.end();
+    return (code == 204 || code == 200);
+}
+
+// ================= CAPTIVE PORTAL DNS SERVER (port từ main.c) =================
+static bool endsWithDomain(const char *qname, const char *domain) {
+    size_t qname_len = strlen(qname);
+    size_t domain_len = strlen(domain);
+    if (qname_len < domain_len) return false;
+    if (qname_len > 0 && qname[qname_len - 1] == '.') qname_len--;
+    if (qname_len < domain_len) return false;
+    const char *qname_end = qname + (qname_len - domain_len);
+    return strncasecmp(qname_end, domain, domain_len) == 0;
+}
+
+void dnsCaptiveTask(void *pv) {
+    struct sockaddr_in server_addr, client_addr;
+    socklen_t addr_len = sizeof(client_addr);
+    uint8_t buffer[512];
+
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) {
+        Serial.println("❌ DNS: Failed to create socket");
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    server_addr.sin_port = htons(53);
+
+    if (bind(sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+        Serial.println("❌ DNS: Failed to bind to port 53");
+        close(sock);
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    Serial.println("✅ DNS Captive Portal started on port 53");
+
+    while (1) {
+        int len = recvfrom(sock, buffer, sizeof(buffer), 0, (struct sockaddr *)&client_addr, &addr_len);
+        if (len > 0 && len >= 12) {
+            bool internet = isInternetAvailable();
+
+            if (internet) {
+                // Có internet -> forward thật lên 8.8.8.8
+                int upstream_sock = socket(AF_INET, SOCK_DGRAM, 0);
+                if (upstream_sock < 0) {
+                    uint8_t resp[512];
+                    memcpy(resp, buffer, len);
+                    resp[2] = 0x81; resp[3] = 0x80;
+                    memset(resp + 4, 0, 8);
+                    sendto(sock, resp, len, 0, (struct sockaddr *)&client_addr, addr_len);
+                } else {
+                    struct sockaddr_in upstream_addr;
+                    upstream_addr.sin_family = AF_INET;
+                    upstream_addr.sin_port = htons(53);
+                    upstream_addr.sin_addr.s_addr = inet_addr("8.8.8.8");
+
+                    int sent = sendto(upstream_sock, buffer, len, 0, (struct sockaddr *)&upstream_addr, sizeof(upstream_addr));
+                    if (sent >= 0) {
+                        struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
+                        setsockopt(upstream_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+                        uint8_t upstream_resp[512];
+                        int up_len = recv(upstream_sock, upstream_resp, sizeof(upstream_resp), 0);
+                        if (up_len > 0) {
+                            sendto(sock, upstream_resp, up_len, 0, (struct sockaddr *)&client_addr, addr_len);
+                        } else {
+                            uint8_t resp[512];
+                            memcpy(resp, buffer, len);
+                            resp[2] = 0x81; resp[3] = 0x80;
+                            memset(resp + 4, 0, 8);
+                            sendto(sock, resp, len, 0, (struct sockaddr *)&client_addr, addr_len);
+                        }
+                    }
+                    close(upstream_sock);
+                }
+            } else {
+                // Chưa có internet -> chỉ spoof domain kiểm tra captive-portal
+                char qname[256] = {0};
+                int qname_len = 0;
+                int pos = 12;
+                bool parse_ok = true;
+                bool compressed = false;
+                while (pos < len && buffer[pos] != 0) {
+                    uint8_t label_len = buffer[pos];
+                    if ((label_len & 0xC0) == 0xC0) { compressed = true; break; }
+                    pos++;
+                    if (pos + label_len > len) { parse_ok = false; break; }
+                    for (int i = 0; i < label_len; i++) {
+                        if (qname_len < (int)sizeof(qname) - 1) qname[qname_len++] = buffer[pos++];
+                        else { parse_ok = false; break; }
+                    }
+                    if (!parse_ok) break;
+                    if (qname_len < (int)sizeof(qname) - 1) qname[qname_len++] = '.';
+                }
+                if (!parse_ok || compressed || qname_len == 0) { vTaskDelay(pdMS_TO_TICKS(1)); continue; }
+                qname[qname_len] = '\0';
+
+                bool is_captive_domain = false;
+                for (int i = 0; captive_domains[i] != NULL; i++) {
+                    if (endsWithDomain(qname, captive_domains[i])) { is_captive_domain = true; break; }
+                }
+
+                if (is_captive_domain) {
+                    uint8_t response[512];
+                    memcpy(response, buffer, len);
+                    response[2] = 0x85; response[3] = 0x80;
+                    memset(response + 4, 0, 8);
+                    response[6] = 0x00; response[7] = 0x01;
+
+                    int qname_end = 12;
+                    bool has_compression = false;
+                    while (qname_end < len && buffer[qname_end] != 0) {
+                        uint8_t label_len = buffer[qname_end];
+                        if ((label_len & 0xC0) == 0xC0) { has_compression = true; break; }
+                        if (qname_end + 1 + label_len > len) break;
+                        qname_end += 1 + label_len;
+                    }
+                    if (has_compression || qname_end >= len || buffer[qname_end] != 0) { vTaskDelay(pdMS_TO_TICKS(1)); continue; }
+
+                    int off = qname_end + 1 + 4;
+                    if (off > len || off + 16 > (int)sizeof(response)) { vTaskDelay(pdMS_TO_TICKS(1)); continue; }
+
+                    response[off++] = 0xC0; response[off++] = 0x0C;
+                    response[off++] = 0x00; response[off++] = 0x01;
+                    response[off++] = 0x00; response[off++] = 0x01;
+                    response[off++] = 0x00; response[off++] = 0x00;
+                    response[off++] = 0x00; response[off++] = 0x3C;
+                    response[off++] = 0x00; response[off++] = 0x04;
+                    response[off++] = 192; response[off++] = 168;
+                    response[off++] = 4;   response[off++] = 1;
+
+                    sendto(sock, response, off, 0, (struct sockaddr *)&client_addr, addr_len);
+                } else {
+                    uint8_t resp[512];
+                    memcpy(resp, buffer, len);
+                    resp[2] = 0x81; resp[3] = 0x83;
+                    memset(resp + 4, 0, 8);
+                    sendto(sock, resp, len, 0, (struct sockaddr *)&client_addr, addr_len);
+                }
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+}
+
+// ================= CAPTIVE PORTAL HTTP HANDLERS (port từ main.c) =================
+void handleCaptive204(AsyncWebServerRequest *r) {
+    if (isInternetAvailable()) {
+        r->send(204);
+    } else {
+        AsyncWebServerResponse *resp = r->beginResponse(302);
+        resp->addHeader("Location", "http://192.168.4.1/");
+        r->send(resp);
+    }
+}
+
+void handleCaptiveSuccess(AsyncWebServerRequest *r) {
+    if (isInternetAvailable()) {
+        r->send(404);
+    } else {
+        AsyncWebServerResponse *resp = r->beginResponse(302);
+        resp->addHeader("Location", "http://192.168.4.1/");
+        r->send(resp);
+    }
 }
 
 // ================= UTILS =================
@@ -179,7 +373,6 @@ String urlDecode(String str) {
 void detectBoardCapabilities() {
     esp_chip_info_t chip_info;
     esp_chip_info(&chip_info);
-
     switch (chip_info.model) {
         case CHIP_ESP32:    board_model = "ESP32"; board_supports_5ghz = false; break;
         case CHIP_ESP32S2:  board_model = "ESP32-S2"; board_supports_5ghz = false; break;
@@ -191,10 +384,7 @@ void detectBoardCapabilities() {
         case CHIP_ESP32P4:  board_model = "ESP32-P4"; board_supports_5ghz = false; break;
         default:            board_model = "ESP32 (Unknown)"; board_supports_5ghz = false; break;
     }
-
     Serial.printf("🔍 Board Detected: %s\n", board_model.c_str());
-    Serial.printf("📡 5GHz Support: %s\n", board_supports_5ghz ? "YES" : "NO");
-
     if (!board_supports_5ghz && use_5ghz) {
         use_5ghz = false;
         Serial.println("⚠️ Board does not support 5GHz - Forcing 2.4GHz mode");
@@ -220,8 +410,7 @@ int validateMaxClients(int clients) {
 }
 
 String validateAPPassword(String pwd) {
-    if (pwd.length() == 0) return "12345678";
-    if (pwd.length() < 8) return "12345678";
+    if (pwd.length() == 0 || pwd.length() < 8) return "12345678";
     return pwd;
 }
 
@@ -239,50 +428,89 @@ int validateNATTCP(int tcp) {
 }
 
 // ================= TEMPERATURE =================
-// FIX (fallback đa nền tảng): trả về NAN (thay vì 0.0f giả) khi chip không
-// có cảm biến, hoặc khi có cảm biến nhưng init/đọc thất bại. 0.0f trước
-// đây bị hiểu nhầm là "0°C thật" trên dashboard; NAN cho phép phân biệt
-// rõ "không có dữ liệu" và được xử lý riêng khi build gói JSON gửi ra.
 float getTemperature() {
-#if SOC_TEMP_SENSOR_SUPPORTED
-    if (!hasTempSensor) return NAN;
+#ifdef CONFIG_IDF_TARGET_ESP32C5
+    return 0.0f;
+#else
     float temp;
     if (temp_sensor_read_celsius(&temp) == ESP_OK) return temp;
-    return NAN;
-#else
-    return NAN;
+    return 0.0f;
 #endif
 }
 
-// ================= DNS =================
-void setupDNS() {
-    if (dns_mode == DNS_MODE_CAPTIVE) {
-        dns.start(53, "*", AP_IP);
-        Serial.println("✅ DNS Captive Portal Mode");
-    } else {
-        dns.start(53, "*", IPAddress(0, 0, 0, 0));
-        Serial.println("✅ DNS Normal Mode");
-    }
-}
-
-// ================= WIFI EVENT HANDLER =================
+// ================= WIFI EVENT HANDLER (port từ main.c: retry + IP_EVENT) =================
 void wifiEventHandler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
-    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_STACONNECTED) {
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        if (sta_configured) esp_wifi_connect();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        bool should_retry = false;
+        xSemaphoreTake(staStateMutex, portMAX_DELAY);
+        sta_disconnected = true;
+        if (s_retry_num < STA_MAX_RETRY) { s_retry_num++; should_retry = true; }
+        xSemaphoreGive(staStateMutex);
+
+        if (should_retry) {
+            esp_wifi_connect();
+            Serial.printf("Retry connecting... (%d/%d)\n", s_retry_num, STA_MAX_RETRY);
+        } else {
+            xEventGroupSetBits(wifiEventGroup, WIFI_FAIL_BIT);
+            Serial.printf("STA retry exhausted, will retry again in background every %d s\n", STA_RECONNECT_BACKOFF_MS / 1000);
+        }
+        disableNAT();
+        internetOK.store(false);
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_STACONNECTED) {
         currentClients.fetch_add(1);
         Serial.printf("✅ Client connected | Total: %d/%d\n", currentClients.load(), max_clients);
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_STADISCONNECTED) {
         int newCount = currentClients.fetch_sub(1) - 1;
         if (newCount < 0) currentClients.store(0);
         Serial.printf("❌ Client disconnected | Total: %d/%d\n", currentClients.load(), max_clients);
-    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        // FIX (port từ main.c): mất uplink STA thì tắt NAT luôn.
-        disableNAT();
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
+        Serial.printf("Got IP: " IPSTR "\n", IP2STR(&event->ip_info.ip));
+        xSemaphoreTake(staStateMutex, portMAX_DELAY);
+        s_retry_num = 0;
+        sta_disconnected = false;
+        xSemaphoreGive(staStateMutex);
+        xEventGroupClearBits(wifiEventGroup, WIFI_FAIL_BIT);
+        xEventGroupSetBits(wifiEventGroup, WIFI_CONNECTED_BIT);
+        // FIX (race no-internet): vừa có IP thì đánh thức internetCheckTask
+        // kiểm tra NGAY, không chờ chu kỳ định kỳ tiếp theo.
+        if (internetCheckTrigger != nullptr) xSemaphoreGive(internetCheckTrigger);
+    }
+}
+
+// ================= TASK NỀN KẾT NỐI LẠI STA (port từ main.c) =================
+void staReconnectTask(void *pv) {
+    esp_task_wdt_add(nullptr);
+    for (;;) {
+        esp_task_wdt_reset();
+        EventBits_t bits = xEventGroupGetBits(wifiEventGroup);
+        bool should_connect = false;
+        xSemaphoreTake(staStateMutex, portMAX_DELAY);
+        if (sta_configured && !(bits & WIFI_CONNECTED_BIT) && sta_disconnected) {
+            should_connect = true;
+            sta_disconnected = false;
+        }
+        xSemaphoreGive(staStateMutex);
+
+        if (should_connect) {
+            Serial.println("Background STA reconnect attempt...");
+            esp_err_t err = esp_wifi_connect();
+            if (err != ESP_OK) {
+                xSemaphoreTake(staStateMutex, portMAX_DELAY);
+                sta_disconnected = true;
+                xSemaphoreGive(staStateMutex);
+                Serial.printf("esp_wifi_connect failed: %s\n", esp_err_to_name(err));
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(STA_RECONNECT_BACKOFF_MS));
     }
 }
 
 // ================= AUTH / RATE LIMIT =================
 bool checkAuthAndRate(AsyncWebServerRequest *r) {
-    if (!r->hasParam("token") || r->getParam("token")->value() != sessionToken) {
+    if (!r->hasParam("token", true) || r->getParam("token", true)->value() != sessionToken) {
         r->send(401, "text/plain", "❌ Unauthorized: token thiếu hoặc sai");
         return false;
     }
@@ -299,176 +527,119 @@ bool checkAuthAndRate(AsyncWebServerRequest *r) {
     return true;
 }
 
-// ================= HTML UI =================
+// ================= HTML UI (port từ main.c: POST+AJAX, prefill, staStatus) =================
 const char index_html[] PROGMEM = R"rawliteral(
 <!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1'>
-<title>APEX ULTRA V22.2.0</title>
+<link rel='icon' href='data:,'>
+<title>APEX ULTRA</title>
 <style>
-*{box-sizing:border-box;}
-body{font-family:Arial,sans-serif;background:#020617;color:#f8fafc;padding:15px;margin:0;}
-.card{background:#1e293b;padding:20px;margin-bottom:15px;border-radius:12px;border:1px solid #334155;}
-input,select{width:100%;padding:12px;margin:8px 0;border-radius:8px;background:#0f172a;color:white;border:1px solid #334155;}
-button{width:100%;padding:14px;background:#38bdf8;color:#020617;border:none;border-radius:8px;font-weight:bold;cursor:pointer;}
-.badge{padding:4px 8px;border-radius:6px;display:inline-block;}
-.warning{color:#f59e0b;}
+*{box-sizing:border-box;}body{font-family:Arial;background:#020617;color:#f8fafc;padding:15px;max-width:480px;margin:0 auto;}
+.card{background:#1e293b;padding:20px;margin-bottom:15px;border-radius:12px;}
+label{display:block;font-size:13px;color:#94a3b8;margin-top:8px;}
+input,select{width:100%;padding:12px;margin:4px 0;border-radius:8px;background:#0f172a;color:white;border:1px solid #334155;}
+input:invalid{border-color:#f87171;}
+button{width:100%;padding:14px;margin-top:10px;background:#38bdf8;color:#020617;border:none;border-radius:8px;font-weight:bold;cursor:pointer;}
+button:disabled{background:#475569;color:#94a3b8;cursor:wait;}
+.warning{color:#f59e0b;margin-top:8px;}
+.hint{font-size:12px;color:#64748b;margin:2px 0 0;}
+.msg{font-size:13px;margin-top:8px;min-height:16px;}
+.msg.ok{color:#4ade80;}.msg.err{color:#f87171;}
 </style></head><body>
-<div class='card'>
-  <h3>🛡️ APEX ULTRA V22.2.0 (Fixed Build)</h3>
-  <div id='boardInfo'></div>
-  <div>📊 RAM: <b id='ram'>0</b> KB</div>
-  <div>🌡️ Temp: <b id='temp'>--</b> °C</div>
-  <div>🌐 Net: <span id='net' class='badge'>WAIT</span></div>
-  <div>🔁 NAT: <span id='nat' class='badge'>WAIT</span></div>
-  <div>📱 Clients: <b id='clientCount'>0</b> / <b id='clientLimit'>0</b></div>
-  <div id='weakPassWarning' class='warning' style='display:none;margin-top:8px;'>⚠️ Đang dùng mật khẩu AP mặc định (12345678) — hãy đổi ngay trong mục cấu hình bên dưới!</div>
+<div class='card'><h3>APEX ULTRA V22.3.0 (Fixed)</h3>
+<div>RAM: <b id='ram'>0</b> KB</div>
+<div>Internet: <span id='net'>WAIT</span></div>
+<div>NAT: <span id='nat'>WAIT</span></div>
+<div>Uplink: <span id='staStatus'>WAIT</span></div>
+<div>Signal: <b id='rssi'>-</b> dBm</div>
+<div>Clients: <b id='clientCount'>0</b> / <b id='clientLimit'>7</b></div>
+<div id='ctable' style='font-size:12px;margin-top:6px;'>-</div>
+<div id='weakWarn' class='warning' style='display:none;'>⚠️ Đang dùng mật khẩu AP mặc định — hãy đổi ngay!</div>
+<div id='pollErr' class='msg err' style='display:none;'>⚠️ Mất kết nối tới thiết bị — đang thử lại...</div>
 </div>
-
-<div class='card'>
-  <h3>📡 Uplink Configuration</h3>
-  <button id='scanBtn'>🔍 Scan WiFi</button>
-  <form action='/save-sta' method='get' class='authForm'>
-    <input name='ssid' id='ssidInp' placeholder='WiFi Name' required>
-    <input name='pass' type='password' placeholder='Password'>
-    <input type='hidden' name='token' class='tokenField' value=''>
-    <button type='submit'>🚀 Connect</button>
-  </form>
-</div>
-
-<div class='card'>
-  <h3>🎛️ Access Point Configuration</h3>
-  <form action='/save-ap' method='get' class='authForm'>
-    <input name='ssid' placeholder='AP SSID' value='APEX_ULTRA'>
-    <input name='pass' type='password' placeholder='AP Password (min 8)'>
-    <input name='channel' placeholder='Channel (1-13 hoặc 36-165)' value='1'>
-    <input type='hidden' name='token' class='tokenField' value=''>
-    <button type='submit'>💾 Save & Reboot</button>
-  </form>
-</div>
-
-<div class='card'>
-  <h3>⚙️ NAT Advanced Settings</h3>
-  <form action='/save-nat' method='get' id='natForm' class='authForm'>
-    <input name='slots' id='natSlots' placeholder='Max NAPT Slots (64-4096)' value='512'>
-    <input name='tcp' id='natTcp' placeholder='Max TCP ports (32-2048)' value='256'>
-    <input type='hidden' name='token' class='tokenField' value=''>
-    <button type='submit'>💾 Save NAT Config & Reboot</button>
-  </form>
-  <small>⚠️ Giá trị này hiện chỉ mang tính lưu lại/hiển thị - kích thước bảng NAT thật do SDK (Kconfig) quyết định.</small>
-</div>
-
-<div class='card'><h3>👥 Connected Clients</h3><div id='ctable' style='font-size:12px;'>-</div></div>
-
+<div class='card'><h3>Uplink Configuration</h3>
+<form id='staForm' action='/save-sta' method='post'>
+<label for='staSsidInp'>Tên WiFi cần kết nối</label>
+<input name='ssid' id='staSsidInp' placeholder='WiFi Name' required maxlength='32'>
+<label for='staPassInp'>Mật khẩu</label>
+<input name='pass' id='staPassInp' type='password' placeholder='Password' maxlength='63'>
+<input type='hidden' name='token' class='tokenField' value=''>
+<button type='submit'>Connect</button>
+<div class='msg' id='staMsg'></div>
+</form></div>
+<div class='card'><h3>AP Configuration</h3>
+<form id='apForm' action='/save-ap' method='post'>
+<label for='apSsidInp'>Tên WiFi phát ra (AP SSID)</label>
+<input name='ssid' id='apSsidInp' placeholder='AP SSID' maxlength='32'>
+<label for='apPassInp'>Mật khẩu mới (tối thiểu 8 ký tự)</label>
+<input name='pass' id='apPassInp' type='password' placeholder='Password (min 8)' minlength='8' maxlength='63'>
+<p class='hint'>Để trống nếu không muốn đổi mật khẩu.</p>
+<input name='channel' placeholder='Channel (1-13)' value=''>
+<input type='hidden' name='token' class='tokenField' value=''>
+<button type='submit'>Save & Reboot</button>
+<div class='msg' id='apMsg'></div>
+</form></div>
+<div class='card'><h3>NAT Settings</h3>
+<form id='natForm' action='/save-nat' method='post'>
+<label for='natSlotsInp'>NAPT Slots (64-4096)</label>
+<input name='slots' id='natSlotsInp' type='number' min='64' max='4096' placeholder='NAPT Slots' value='512'>
+<label for='natTcpInp'>TCP ports (32-2048)</label>
+<input name='tcp' id='natTcpInp' type='number' min='32' max='2048' placeholder='TCP ports' value='256'>
+<input type='hidden' name='token' class='tokenField' value=''>
+<button type='submit'>Save & Reboot</button>
+<div class='msg' id='natMsg'></div>
+</form></div>
 <script>
-let ws = new WebSocket('ws://' + location.hostname + '/ws');
-ws.onmessage = e => {
-    let d = JSON.parse(e.data);
-    document.getElementById('ram').innerText = Math.round(d.ram/1024);
-    document.getElementById('temp').innerText = (d.temp === null || d.temp === undefined) ? 'N/A' : d.temp;
-    document.getElementById('net').innerText = d.internet ? 'ONLINE' : 'OFFLINE';
-    document.getElementById('nat').innerText = d.nat ? 'ACTIVE' : 'OFF';
-    document.getElementById('clientCount').innerText = d.clientCount;
-    document.getElementById('clientLimit').innerText = d.clientLimit;
-    document.getElementById('weakPassWarning').style.display = d.weakPassword ? 'block' : 'none';
-    let h = '';
-    d.clients.forEach(c => { h += `<div>• ${c.ip} <small>[${c.mac}]</small></div>`; });
-    document.getElementById('ctable').innerHTML = h || '<i>No clients</i>';
-};
-
+let pollFailed=0;
+function fetchData(){fetch('/api/status').then(r=>r.json()).then(d=>{
+pollFailed=0;document.getElementById('pollErr').style.display='none';
+document.getElementById('ram').innerText=Math.round(d.ram/1024);
+document.getElementById('net').innerText=d.internet?'ONLINE':'OFFLINE';
+document.getElementById('nat').innerText=d.nat?'ACTIVE':'OFF';
+document.getElementById('staStatus').innerText=d.staConnected?('Connected: '+d.staSsid):(d.staSsid?'Connecting to '+d.staSsid+'...':'Not configured');
+document.getElementById('rssi').innerText=d.staConnected?d.rssi:'-';
+document.getElementById('clientCount').innerText=d.clientCount;
+document.getElementById('clientLimit').innerText=d.clientLimit;
+document.getElementById('weakWarn').style.display=d.weakPassword?'block':'none';
+}).catch(()=>{pollFailed++;if(pollFailed>=2)document.getElementById('pollErr').style.display='block';});}
+setInterval(fetchData,2000);fetchData();
+function fetchClients(){fetch('/api/clients').then(r=>r.json()).then(list=>{
+const el=document.getElementById('ctable');
+if(!list.length){el.innerHTML='<i>No clients</i>';return;}
+el.innerHTML=list.map(c=>`<div>• ${c.ip} <small>[${c.mac}]</small></div>`).join('');
+}).catch(()=>{});}
+setInterval(fetchClients,5000);fetchClients();
+function loadConfig(){fetch('/api/config').then(r=>r.json()).then(c=>{
+document.getElementById('apSsidInp').value=c.apSsid;
+if(c.staSsid){document.getElementById('staSsidInp').value=c.staSsid;}
+});}
+loadConfig();
 fetch('/get-token').then(r=>r.json()).then(t=>{
-    document.querySelectorAll('.tokenField').forEach(el => el.value = t.token);
+document.querySelectorAll('.tokenField').forEach(el=>el.value=t.token);
 });
-
-document.getElementById('scanBtn').onclick = async () => {
-    let btn = document.getElementById('scanBtn');
-    btn.innerText = '⏳ Scanning...';
-    await fetch('/scan');
-    let tries = 0;
-    let poll = setInterval(async () => {
-        let r = await fetch('/scan-status');
-        let d = await r.json();
-        tries++;
-        if (d.ready) {
-            clearInterval(poll);
-            let nets = d.networks;
-            let list = nets.map((n,i)=> i+": "+n.ssid+" ("+n.rssi+"dBm)").join("\n");
-            let s = prompt("Select WiFi (enter number):\n"+list);
-            if (s !== null && nets[s]) document.getElementById('ssidInp').value = nets[s].ssid;
-            btn.innerText = '🔍 Scan WiFi';
-        } else if (tries > 100) {
-            clearInterval(poll);
-            btn.innerText = '🔍 Scan WiFi';
-        }
-    }, 300);
-};
-
-fetch('/get-board-info').then(r=>r.json()).then(info=>{
-    document.getElementById('boardInfo').innerHTML = `🔧 Board: ${info.model} | 5GHz: ${info.supports_5ghz ? '✅' : '❌'}`;
-});
-fetch('/get-nat-config').then(r=>r.json()).then(nat=>{
-    document.getElementById('natSlots').value = nat.slots;
-    document.getElementById('natTcp').value = nat.tcp;
-});
+function bindForm(formId,msgId,rebootWarn){
+const form=document.getElementById(formId);
+const msg=document.getElementById(msgId);
+const btn=form.querySelector('button');
+form.addEventListener('submit',function(ev){
+ev.preventDefault();
+btn.disabled=true;btn.innerText='Đang lưu...';
+msg.className='msg';msg.innerText='';
+fetch(form.action,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams(new FormData(form)).toString()})
+.then(async r=>{const t=await r.text();if(r.ok){msg.className='msg ok';msg.innerText=t+(rebootWarn?' Thiết bị sẽ mất kết nối vài giây...':'');}
+else{msg.className='msg err';msg.innerText=t;btn.disabled=false;btn.innerText='Retry';}})
+.catch(()=>{msg.className='msg err';msg.innerText='Không thể kết nối tới thiết bị.';btn.disabled=false;btn.innerText='Retry';});
+});}
+bindForm('staForm','staMsg',true);
+bindForm('apForm','apMsg',true);
+bindForm('natForm','natMsg',true);
 </script></body></html>
 )rawliteral";
 
-// ================= SCAN (bất đồng bộ, không block AsyncTCP task) =================
-void scanTaskFn(void *pv) {
-    WiFi.scanNetworks(true);
-    int n = -1, timeout = 8000, elapsed = 0;
-
-    while (n == -1 && elapsed < timeout) {
-        vTaskDelay(pdMS_TO_TICKS(100));
-        n = WiFi.scanComplete();
-        elapsed += 100;
-    }
-
-    JsonDocument doc;
-    JsonArray array = doc.to<JsonArray>();
-
-    if (n > 0) {
-        int limit = min(n, MAX_SCAN_NETWORKS);
-        for (int i = 0; i < limit; i++) {
-            JsonObject item = array.add<JsonObject>();
-            item["ssid"] = WiFi.SSID(i);
-            item["rssi"] = WiFi.RSSI(i);
-        }
-    }
-    WiFi.scanDelete();
-
-    String out;
-    serializeJson(doc, out);
-    scanResultJson = out;
-    scanReady = true;
-    scanInProgress.store(false);
-    vTaskDelete(nullptr);
-}
-
-void handleScan(AsyncWebServerRequest *r) {
-    if (scanInProgress.exchange(true)) {
-        r->send(429, "application/json", "[]");
-        return;
-    }
-    scanReady = false;
-    scanResultJson = "[]";
-    xTaskCreate(scanTaskFn, "SCAN", 4096, nullptr, 1, nullptr);
-    r->send(202, "application/json", "{\"status\":\"scanning\"}");
-}
-
-void handleScanStatus(AsyncWebServerRequest *r) {
-    String json = "{\"ready\":";
-    json += scanReady ? "true" : "false";
-    json += ",\"networks\":";
-    json += scanReady ? scanResultJson : "[]";
-    json += "}";
-    r->send(200, "application/json", json);
-}
-
-// ================= NETWORK TASK =================
+// ================= NETWORK TASK (chỉ còn broadcast + client list + temp) =================
 void networkTask(void * pv) {
     esp_task_wdt_add(nullptr);
     static uint32_t lastBroadcast = 0;
     static unsigned long lastTempUpdate = 0;
-    static int lastClientCount = -1;
 
     for (;;) {
         esp_task_wdt_reset();
@@ -479,18 +650,10 @@ void networkTask(void * pv) {
             Serial.println("⚠️ Memory critical - NAT disabled");
         }
 
-        if (WiFi.status() == WL_CONNECTED) {
-            enableNAT();
-            lastRSSI.store(WiFi.RSSI());
-        } else {
-            lastRSSI.store(-100);
-        }
+        lastRSSI.store((WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : -100);
 
         if (millis() - lastTempUpdate > TEMP_UPDATE_INTERVAL) {
-            float t = getTemperature();
-            // FIX: ép NAN sang int là undefined behavior -> dùng sentinel
-            // TEMP_NO_SENSOR để đánh dấu "không có dữ liệu nhiệt độ".
-            lastTemp.store(isnan(t) ? TEMP_NO_SENSOR : (int)(t * 10));
+            lastTemp.store((int)(getTemperature() * 10));
             lastTempUpdate = millis();
         }
 
@@ -500,49 +663,9 @@ void networkTask(void * pv) {
             doc["internet"] = internetOK.load();
             doc["nat"] = natEnabled.load();
             doc["rssi"] = lastRSSI.load();
-            {
-                int rawTemp = lastTemp.load();
-                if (rawTemp == TEMP_NO_SENSOR) {
-                    doc["temp"] = nullptr; // FIX: fallback rõ ràng, không giả 0°C
-                } else {
-                    doc["temp"] = rawTemp / 10.0;
-                }
-            }
-            doc["uptime"] = (millis() - uptimeStart) / 1000;
             doc["clientCount"] = currentClients.load();
             doc["clientLimit"] = max_clients;
             doc["weakPassword"] = (ap_pass == "12345678");
-
-            JsonArray clis = doc["clients"].to<JsonArray>();
-            wifi_sta_list_t wifi_sta_list;
-            esp_wifi_ap_get_sta_list(&wifi_sta_list);
-
-            if (lastClientCount != wifi_sta_list.num) {
-                lastClientCount = wifi_sta_list.num;
-                Serial.printf("📡 Clients: %d/%d\n", lastClientCount, max_clients);
-            }
-
-            // FIX (port từ main.c): lấy IP theo MAC qua DHCP server chính
-            // thức thay vì tự đọc bảng arp nội bộ của lwIP.
-            int num = wifi_sta_list.num;
-            if (num > 10) num = 10;
-            if (num > 0 && s_ap_netif != nullptr) {
-                esp_netif_pair_mac_ip_t pairs[10] = {0};
-                for (int i = 0; i < num; i++) {
-                    memcpy(pairs[i].mac, wifi_sta_list.sta[i].mac, 6);
-                }
-                esp_netif_dhcps_get_clients_by_mac(s_ap_netif, num, pairs);
-
-                for (int i = 0; i < num; i++) {
-                    JsonObject c = clis.add<JsonObject>();
-                    char m[18];
-                    sprintf(m, "%02X:%02X:%02X:%02X:%02X:%02X",
-                            pairs[i].mac[0], pairs[i].mac[1], pairs[i].mac[2],
-                            pairs[i].mac[3], pairs[i].mac[4], pairs[i].mac[5]);
-                    c["mac"] = m;
-                    c["ip"] = IPAddress(pairs[i].ip.addr).toString();
-                }
-            }
 
             String out;
             serializeJson(doc, out);
@@ -550,6 +673,42 @@ void networkTask(void * pv) {
             lastBroadcast = millis();
         }
         vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
+// ================= INTERNET CHECK TASK (port từ main.c) =================
+// FIX: NAT giờ chỉ bật khi THẬT SỰ có internet (kiểm tra HTTP thật), không
+// chỉ dựa vào WiFi.status()==WL_CONNECTED như bản cũ.
+void internetCheckTask(void *pv) {
+    esp_task_wdt_add(nullptr);
+    for (;;) {
+        esp_task_wdt_reset();
+
+        bool sta_connected = (xEventGroupGetBits(wifiEventGroup) & WIFI_CONNECTED_BIT) != 0;
+        bool reachable = sta_connected ? performInternetCheck() : false;
+        internetReachable.store(reachable);
+
+        bool should_be_online = sta_connected && reachable;
+
+        if (should_be_online) {
+            if (!natEnabled.load()) {
+                if (!enableNAT()) should_be_online = false;
+            }
+        } else {
+            if (natEnabled.load()) disableNAT();
+        }
+
+        internetOK.store(should_be_online);
+
+        if (should_be_online) {
+            Serial.println("✅ Internet: ONLINE");
+        } else {
+            Serial.printf("❌ Internet: OFFLINE (STA=%d, Reachable=%d)\n", sta_connected, reachable);
+        }
+
+        // FIX (race no-internet): chờ tối đa 10s, đánh thức ngay nếu STA vừa
+        // có IP (xem wifiEventHandler).
+        xSemaphoreTake(internetCheckTrigger, pdMS_TO_TICKS(10000));
     }
 }
 
@@ -562,11 +721,15 @@ void setup() {
     detectBoardCapabilities();
     prefs.begin("apex-v22", false);
     prefsMutex = xSemaphoreCreateMutex();
+    staStateMutex = xSemaphoreCreateMutex();
+    internetCheckTrigger = xSemaphoreCreateBinary();
+    wifiEventGroup = xEventGroupCreate();
 
     sta_ssid = prefs.getString("sta_ssid", "");
     sta_pass = prefs.getString("sta_pass", "");
     ap_ssid = prefs.getString("ap_ssid", "APEX_ULTRA");
     ap_pass = validateAPPassword(prefs.getString("ap_pass", "12345678"));
+    sta_configured = (sta_ssid.length() > 0);
 
     if (board_supports_5ghz) {
         use_5ghz = prefs.getBool("use_5ghz", DEFAULT_BAND_5GHZ);
@@ -575,7 +738,6 @@ void setup() {
     ap_channel = validateChannel(prefs.getInt("ap_channel", DEFAULT_AP_CHANNEL), use_5ghz);
     ap_hidden = prefs.getBool("ap_hidden", DEFAULT_AP_HIDDEN);
     max_clients = validateMaxClients(prefs.getInt("max_clients", DEFAULT_MAX_CLIENTS));
-    dns_mode = prefs.getInt("dns_mode", DEFAULT_DNS_MODE);
 
     int saved_tcp = validateNATTCP(prefs.getInt("nat_tcp", DEFAULT_NAPT_TCP));
     int saved_slots = validateNATSlots(prefs.getInt("nat_slots", DEFAULT_NAPT_SLOTS), saved_tcp);
@@ -584,40 +746,22 @@ void setup() {
 
     sessionToken = String((uint32_t)esp_random(), HEX) + String((uint32_t)esp_random(), HEX);
 
-    Serial.println("\n=== APEX ULTRA V22.2.0 - FIXED BUILD ===\n");
+    Serial.println("\n=== APEX ULTRA V22.3.0 - FIXED BUILD ===\n");
     if (ap_pass == "12345678") {
         Serial.println("⚠️ CẢNH BÁO: đang dùng mật khẩu AP mặc định, hãy đổi ngay!");
     }
 
-    // FIX (fallback đa nền tảng): thử init cảm biến nhiệt độ thật sự và
-    // kiểm tra mã lỗi trả về, thay vì gọi rồi bỏ qua kết quả. Nếu chip
-    // không hỗ trợ (SOC_TEMP_SENSOR_SUPPORTED == 0) hoặc init/start thất
-    // bại vì bất kỳ lý do gì, hasTempSensor = false và toàn hệ thống
-    // (getTemperature(), JSON gửi ra, dashboard) tự động fallback về
-    // "N/A" một cách nhất quán.
-#if SOC_TEMP_SENSOR_SUPPORTED
+#ifndef CONFIG_IDF_TARGET_ESP32C5
     temp_sensor_config_t temp_sensor = TSENS_CONFIG_DEFAULT();
     temp_sensor.dac_offset = TSENS_DAC_L2;
-    if (temp_sensor_set_config(temp_sensor) == ESP_OK &&
-        temp_sensor_start() == ESP_OK) {
-        hasTempSensor = true;
-        Serial.println("🌡️ Cảm biến nhiệt độ: OK");
-    } else {
-        hasTempSensor = false;
-        Serial.println("⚠️ Cảm biến nhiệt độ init thất bại - fallback N/A");
-    }
-#else
-    hasTempSensor = false;
-    Serial.println("⚠️ Chip này không có cảm biến nhiệt độ nội bộ - fallback N/A");
+    temp_sensor_set_config(temp_sensor);
+    temp_sensor_start();
 #endif
 
     WiFi.mode(WIFI_AP_STA);
     WiFi.softAPConfig(AP_IP, AP_GATEWAY, AP_SUBNET);
     WiFi.softAP(ap_ssid.c_str(), ap_pass.c_str(), ap_channel, ap_hidden ? 1 : 0, max_clients);
 
-    // FIX (napt v2, port từ main.c): lấy handle esp_netif của AP ngay sau
-    // khi softAP() đã tạo xong interface, dùng cho esp_netif_napt_enable/
-    // disable() và esp_netif_dhcps_get_clients_by_mac() về sau.
     s_ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
     if (s_ap_netif == nullptr) {
         Serial.println("❌ Không lấy được AP netif handle - NAT sẽ không hoạt động!");
@@ -626,6 +770,8 @@ void setup() {
     Serial.printf("📡 AP: %s | Ch:%d | IP: %s\n", ap_ssid.c_str(), ap_channel, AP_IP.toString().c_str());
 
     ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
+                                                        &wifiEventHandler, nullptr, nullptr));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
                                                         &wifiEventHandler, nullptr, nullptr));
 
     if (sta_ssid.length() > 0) {
@@ -636,100 +782,144 @@ void setup() {
     }
 
     server.on("/", HTTP_GET, [](AsyncWebServerRequest *r){ r->send_P(200, "text/html", index_html); });
-    server.on("/scan", HTTP_GET, handleScan);
-    server.on("/scan-status", HTTP_GET, handleScanStatus);
 
     server.on("/get-token", HTTP_GET, [](AsyncWebServerRequest *r){
         String json = "{\"token\":\"" + sessionToken + "\"}";
         r->send(200, "application/json", json);
     });
 
-    server.on("/get-board-info", HTTP_GET, [](AsyncWebServerRequest *r){
-        String json = "{\"model\":\"" + board_model + "\",\"supports_5ghz\":" +
-                      String(board_supports_5ghz ? "true" : "false") + "}";
-        r->send(200, "application/json", json);
+    server.on("/api/status", HTTP_GET, [](AsyncWebServerRequest *r){
+        JsonDocument doc;
+        doc["ram"] = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+        doc["internet"] = internetOK.load();
+        doc["nat"] = natEnabled.load();
+        doc["rssi"] = lastRSSI.load();
+        doc["clientCount"] = currentClients.load();
+        doc["clientLimit"] = max_clients;
+        bool staConnected = (xEventGroupGetBits(wifiEventGroup) & WIFI_CONNECTED_BIT) != 0;
+        doc["staConnected"] = staConnected;
+        doc["staSsid"] = sta_ssid;
+        doc["weakPassword"] = (ap_pass == "12345678");
+        String out;
+        serializeJson(doc, out);
+        r->send(200, "application/json", out);
     });
 
-    server.on("/get-nat-config", HTTP_GET, [](AsyncWebServerRequest *r){
-        String json = "{\"slots\":" + String(nat_max_slots) + ",\"tcp\":" + String(nat_max_tcp) + "}";
-        r->send(200, "application/json", json);
+    server.on("/api/config", HTTP_GET, [](AsyncWebServerRequest *r){
+        JsonDocument doc;
+        doc["apSsid"] = ap_ssid;
+        doc["staSsid"] = sta_ssid;
+        String out;
+        serializeJson(doc, out);
+        r->send(200, "application/json", out);
     });
 
-    server.on("/save-sta", HTTP_GET, [](AsyncWebServerRequest *r){
+    server.on("/api/clients", HTTP_GET, [](AsyncWebServerRequest *r){
+        JsonDocument doc;
+        JsonArray arr = doc.to<JsonArray>();
+        wifi_sta_list_t wifi_sta_list;
+        if (esp_wifi_ap_get_sta_list(&wifi_sta_list) == ESP_OK && s_ap_netif != nullptr) {
+            int num = wifi_sta_list.num;
+            if (num > 10) num = 10;
+            if (num > 0) {
+                esp_netif_pair_mac_ip_t pairs[10] = {0};
+                for (int i = 0; i < num; i++) memcpy(pairs[i].mac, wifi_sta_list.sta[i].mac, 6);
+                esp_netif_dhcps_get_clients_by_mac(s_ap_netif, num, pairs);
+                for (int i = 0; i < num; i++) {
+                    JsonObject c = arr.add<JsonObject>();
+                    char m[18];
+                    sprintf(m, "%02X:%02X:%02X:%02X:%02X:%02X",
+                            pairs[i].mac[0], pairs[i].mac[1], pairs[i].mac[2],
+                            pairs[i].mac[3], pairs[i].mac[4], pairs[i].mac[5]);
+                    c["mac"] = m;
+                    c["ip"] = IPAddress(pairs[i].ip.addr).toString();
+                }
+            }
+        }
+        String out;
+        serializeJson(doc, out);
+        r->send(200, "application/json", out);
+    });
+
+    server.on("/save-sta", HTTP_POST, [](AsyncWebServerRequest *r){
         if (!checkAuthAndRate(r)) return;
         xSemaphoreTake(prefsMutex, portMAX_DELAY);
-        if (r->hasParam("ssid")) prefs.putString("sta_ssid", r->getParam("ssid")->value());
-        if (r->hasParam("pass")) prefs.putString("sta_pass", r->getParam("pass")->value());
+        if (r->hasParam("ssid", true)) prefs.putString("sta_ssid", r->getParam("ssid", true)->value());
+        if (r->hasParam("pass", true)) prefs.putString("sta_pass", r->getParam("pass", true)->value());
         xSemaphoreGive(prefsMutex);
-        r->send(200, "text/plain", "✅ STA Saved. Rebooting...");
+        r->send(200, "text/plain", "STA Saved. Rebooting...");
         delay(1000);
         ESP.restart();
     });
 
-    server.on("/save-ap", HTTP_GET, [](AsyncWebServerRequest *r){
+    server.on("/save-ap", HTTP_POST, [](AsyncWebServerRequest *r){
         if (!checkAuthAndRate(r)) return;
         xSemaphoreTake(prefsMutex, portMAX_DELAY);
-        if (r->hasParam("ssid")) prefs.putString("ap_ssid", r->getParam("ssid")->value());
-        if (r->hasParam("pass")) {
-            String p = r->getParam("pass")->value();
+        if (r->hasParam("ssid", true)) prefs.putString("ap_ssid", r->getParam("ssid", true)->value());
+        if (r->hasParam("pass", true)) {
+            String p = r->getParam("pass", true)->value();
             if (p.length() >= 8) prefs.putString("ap_pass", p);
         }
-        if (r->hasParam("channel")) {
-            int ch = r->getParam("channel")->value().toInt();
-            prefs.putInt("ap_channel", validateChannel(ch, use_5ghz));
+        if (r->hasParam("channel", true)) {
+            int ch = r->getParam("channel", true)->value().toInt();
+            if (ch > 0) prefs.putInt("ap_channel", validateChannel(ch, use_5ghz));
         }
         xSemaphoreGive(prefsMutex);
-        r->send(200, "text/plain", "✅ AP Saved. Rebooting...");
+        r->send(200, "text/plain", "AP Saved. Rebooting...");
         delay(1000);
         ESP.restart();
     });
 
-    server.on("/save-nat", HTTP_GET, [](AsyncWebServerRequest *r){
+    server.on("/save-nat", HTTP_POST, [](AsyncWebServerRequest *r){
         if (!checkAuthAndRate(r)) return;
         int new_tcp = DEFAULT_NAPT_TCP;
         int new_slots = DEFAULT_NAPT_SLOTS;
-
         xSemaphoreTake(prefsMutex, portMAX_DELAY);
-        if (r->hasParam("tcp")) {
-            new_tcp = validateNATTCP(r->getParam("tcp")->value().toInt());
+        if (r->hasParam("tcp", true)) {
+            new_tcp = validateNATTCP(r->getParam("tcp", true)->value().toInt());
             prefs.putInt("nat_tcp", new_tcp);
         }
-        if (r->hasParam("slots")) {
-            new_slots = validateNATSlots(r->getParam("slots")->value().toInt(), new_tcp);
+        if (r->hasParam("slots", true)) {
+            new_slots = validateNATSlots(r->getParam("slots", true)->value().toInt(), new_tcp);
             prefs.putInt("nat_slots", new_slots);
         }
         xSemaphoreGive(prefsMutex);
-        r->send(200, "text/plain", "✅ NAT Config Saved. Rebooting...");
+        r->send(200, "text/plain", "NAT Config Saved. Rebooting...");
         delay(1000);
         ESP.restart();
     });
 
+    // Captive portal HTTP handlers (port từ main.c)
+    server.on("/generate_204", HTTP_GET, handleCaptive204);
+    server.on("/connectivity-check", HTTP_GET, handleCaptive204);
+    server.on("/success", HTTP_GET, handleCaptiveSuccess);
+    server.on("/captive", HTTP_GET, handleCaptive204);
+    server.on("/hotspot-detect.html", HTTP_GET, handleCaptive204);
+    server.on("/library/test/success.html", HTTP_GET, handleCaptive204);
+    server.on("/ncsi.txt", HTTP_GET, handleCaptive204);
+    server.on("/canonical.html", HTTP_GET, handleCaptive204);
+    server.on("/apple-sd", HTTP_GET, handleCaptive204);
+
     ws.onEvent([](AsyncWebSocket *s, AsyncWebSocketClient *c, AwsEventType t, void *arg, uint8_t *data, size_t len) {
-        if (t == WS_EVT_DATA && len == 4 && memcmp(data, "ping", 4) == 0) {
-            c->text("pong");
-        }
+        if (t == WS_EVT_DATA && len == 4 && memcmp(data, "ping", 4) == 0) c->text("pong");
     });
     server.addHandler(&ws);
     server.begin();
-    setupDNS();
 
-    xTaskCreatePinnedToCore([](void* p){
-        esp_task_wdt_add(nullptr);
-        for (;;) {
-            esp_task_wdt_reset();
-            if (WiFi.status() == WL_CONNECTED) {
-                WiFiClient c;
-                c.setTimeout(1500);
-                internetOK.store(c.connect("1.1.1.1", 53));
-                c.stop();
-            } else {
-                internetOK.store(false);
-            }
-            vTaskDelay(20000);
-        }
-    }, "CHK", 2048, nullptr, 1, nullptr, 1);
+    xTaskCreate(dnsCaptiveTask, "DNS_CAPTIVE", 4096, nullptr, 5, nullptr);
+    xTaskCreate(internetCheckTask, "INET_CHECK", 4096, nullptr, 2, nullptr);
+    xTaskCreate(staReconnectTask, "STA_RECONNECT", 3072, nullptr, 2, nullptr);
 
+#if ESP_IDF_VERSION_MAJOR >= 5
+    esp_task_wdt_config_t wdt_config = {
+        .timeout_ms = WATCHDOG_TIMEOUT * 1000,
+        .idle_core_mask = (1 << 0) | (1 << 1),
+        .trigger_panic = true,
+    };
+    esp_task_wdt_init(&wdt_config);
+#else
     esp_task_wdt_init(WATCHDOG_TIMEOUT, true);
+#endif
     esp_task_wdt_add(nullptr);
     xTaskCreatePinnedToCore(networkTask, "NET", 8192, nullptr, 4, nullptr, 0);
 
@@ -739,12 +929,12 @@ void setup() {
         digitalWrite(LED_BUILTIN, HIGH); delay(80);
     }
 
-    Serial.printf("✅ APEX ULTRA V22.2.0 Ready on %s!\n", board_model.c_str());
+    Serial.printf("✅ APEX ULTRA V22.3.0 Ready on %s!\n", board_model.c_str());
     Serial.printf("🔑 Session token: %s\n", sessionToken.c_str());
+    Serial.println("✅ Captive Portal: DNS + HTTP handlers enabled");
 }
 
 void loop() {
-    dns.processNextRequest();
     esp_task_wdt_reset();
     vTaskDelay(10);
 }
