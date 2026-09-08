@@ -1,3 +1,4 @@
-ESPAsyncWebServer@3.7.7
-AsyncTCP@3.4.0
-ArduinoJson@7.4.3
+# Định dạng: tên thư viện URL_GIT
+ESPAsyncWebServer https://github.com/ESP32Async/ESPAsyncWebServer.git
+AsyncTCP https://github.com/ESP32Async/AsyncTCP.git
+ArduinoJson https://github.com/bblanchon/ArduinoJson.git
