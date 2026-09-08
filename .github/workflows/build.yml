@@ -65,7 +65,7 @@ jobs:
           ls -lh .pio/build/esp32dev/merged.bin
           echo "✅ Build and merge successful!"
 
-  # Job 2: Build Arduino (ESP_Code.ino) bằng arduino-cli, sử dụng requirements.arduino
+  # Job 2: Build Arduino (ESP_Code.ino) bằng arduino-cli, sử dụng requirements.arduino (Hybrid)
   build-arduino-ino:
     needs: build-espidf
     runs-on: ubuntu-latest
@@ -89,21 +89,31 @@ jobs:
       - name: Update library index
         run: arduino-cli lib update-index
 
-      - name: Install libraries from requirements.arduino
+      - name: Install libraries from requirements.arduino (Hybrid)
         run: |
-          # Bật chế độ cài từ git (cần thiết cho --git-url)
+          # Bật chế độ cài từ git
           arduino-cli config set library.enable_unsafe_install true
 
           while IFS= read -r line; do
             # Bỏ qua dòng trống và comment
             [[ -z "$line" || "$line" =~ ^# ]] && continue
-            # Tách tên thư viện và URL Git
-            lib_name=$(echo "$line" | awk '{print $1}')
-            git_url=$(echo "$line" | awk '{print $2}')
             
-            if [[ -n "$lib_name" && -n "$git_url" ]]; then
-              echo "Installing $lib_name from $git_url ..."
+            # Tách các trường
+            field1=$(echo "$line" | awk '{print $1}')
+            field2=$(echo "$line" | awk '{print $2}')
+            
+            # Kiểm tra xem dòng có chứa URL (http/https) không
+            if [[ "$field2" =~ ^https?:// ]]; then
+              # Đây là Git URL - cài từ GitHub
+              lib_name="$field1"
+              git_url="$field2"
+              echo "Installing $lib_name from Git: $git_url ..."
               arduino-cli lib install --git-url "$git_url"
+            else
+              # Đây là tên@phiên bản - cài từ Library Manager
+              lib_spec="$field1"
+              echo "Installing $lib_spec from Library Manager ..."
+              arduino-cli lib install "$lib_spec"
             fi
           done < requirements.arduino
 
