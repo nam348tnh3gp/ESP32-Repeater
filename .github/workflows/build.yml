@@ -5,7 +5,7 @@ name: Build ESP32 NAT Router
     branches: [ main, master ]
   pull_request:
     branches: [ main, master ]
-  workflow_dispatch:   # cho phép chạy thủ công
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -44,13 +44,13 @@ jobs:
           echo "✅ Merged file created: merged.bin"
           ls -lh merged.bin
 
-      - name: Upload merged firmware (1 file duy nhất)
+      - name: Upload merged firmware
         uses: actions/upload-artifact@v4
         with:
           name: esp32-nat-router
           path: .pio/build/esp32dev/merged.bin
 
-      - name: Upload individual files (optional, để debug)
+      - name: Upload individual files (optional)
         uses: actions/upload-artifact@v4
         with:
           name: esp32-individual-files
@@ -65,7 +65,7 @@ jobs:
           ls -lh .pio/build/esp32dev/merged.bin
           echo "✅ Build and merge successful!"
 
-  # Job 2: Build Arduino (ESP_Code.ino) bằng arduino-cli, sử dụng requirements.arduino (Hybrid)
+  # Job 2: Build Arduino (ESP_Code.ino) với arduino-cli
   build-arduino-ino:
     needs: build-espidf
     runs-on: ubuntu-latest
@@ -89,35 +89,59 @@ jobs:
       - name: Update library index
         run: arduino-cli lib update-index
 
-      - name: Install libraries from requirements.arduino (Hybrid)
+      - name: Debug requirements.arduino content
+        run: |
+          echo "📄 Raw content of requirements.arduino:"
+          cat -A requirements.arduino
+          echo ""
+          echo "📊 Line count:"
+          wc -l requirements.arduino
+          echo ""
+          echo "🔍 Parsing each line:"
+          while IFS= read -r line; do
+            [[ -z "$line" ]] && echo "  → Empty line"
+            [[ "$line" =~ ^# ]] && echo "  → Comment: $line"
+          done < requirements.arduino
+
+      - name: Install libraries from requirements.arduino (Hybrid - Fixed)
         run: |
           # Bật chế độ cài từ git
           arduino-cli config set library.enable_unsafe_install true
 
+          # Đọc từng dòng và xử lý
           while IFS= read -r line; do
             # Bỏ qua dòng trống và comment
-            [[ -z "$line" || "$line" =~ ^# ]] && continue
+            [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
             
-            # Tách các trường
-            field1=$(echo "$line" | awk '{print $1}')
-            field2=$(echo "$line" | awk '{print $2}')
+            # Trim khoảng trắng đầu và cuối dòng
+            line_trimmed=$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+            [[ -z "$line_trimmed" ]] && continue
+            
+            # Tách field1 và field2
+            field1=$(echo "$line_trimmed" | awk '{print $1}')
+            field2=$(echo "$line_trimmed" | awk '{print $2}')
+            
+            echo "🔧 Processing: field1='$field1', field2='$field2'"
             
             # Kiểm tra xem dòng có chứa URL (http/https) không
-            if [[ "$field2" =~ ^https?:// ]]; then
+            if [[ -n "$field2" && "$field2" =~ ^https?:// ]]; then
               # Đây là Git URL - cài từ GitHub
-              lib_name="$field1"
-              git_url="$field2"
-              echo "Installing $lib_name from Git: $git_url ..."
-              arduino-cli lib install --git-url "$git_url"
-            else
+              echo "📦 Installing $field1 from Git: $field2 ..."
+              arduino-cli lib install --git-url "$field2"
+            elif [[ -n "$field1" ]]; then
               # Đây là tên@phiên bản - cài từ Library Manager
-              lib_spec="$field1"
-              echo "Installing $lib_spec from Library Manager ..."
-              arduino-cli lib install "$lib_spec"
+              echo "📦 Installing $field1 from Library Manager ..."
+              arduino-cli lib install "$field1"
+            else
+              echo "⚠️ Skipping invalid line: $line_trimmed"
             fi
           done < requirements.arduino
 
-      # arduino-cli yêu cầu file .ino nằm trong thư mục trùng tên
+      - name: Verify installed libraries
+        run: |
+          echo "📚 Installed libraries in Arduino/libraries:"
+          ls -la ~/Arduino/libraries/ | grep -E "AsyncTCP|ESPAsyncWebServer|ArduinoJson" || echo "⚠️ Some libraries not found!"
+
       - name: Prepare sketch folder
         run: |
           mkdir -p build_sketch/ESP_Code
