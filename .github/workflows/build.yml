@@ -1,14 +1,17 @@
 name: Build ESP32 NAT Router
 
-on:
+"on":
   push:
     branches: [ main, master ]
   pull_request:
     branches: [ main, master ]
   workflow_dispatch:   # cho phép chạy thủ công
 
+permissions:
+  contents: read
+
 jobs:
-  build:
+  build-espidf:
     runs-on: ubuntu-latest
 
     steps:
@@ -19,13 +22,14 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.x'
+          cache: 'pip'
 
       - name: Install PlatformIO & esptool
         run: |
           python -m pip install --upgrade pip
           pip install platformio esptool
 
-      - name: Build firmware
+      - name: Build firmware (main.c - ESP-IDF)
         run: pio run
 
       - name: Merge 3 files into 1 (merged.bin)
@@ -58,3 +62,52 @@ jobs:
           echo "📦 File merged.bin size:"
           ls -lh .pio/build/esp32dev/merged.bin
           echo "✅ Build and merge successful!"
+
+  # FIX: job mới - build ESP_Code.ino bằng arduino-cli (không dùng PlatformIO),
+  # để kiểm tra file .ino build được trên đúng công cụ Arduino IDE CLI thật,
+  # thay vì chỉ đoán qua đọc code.
+  build-arduino-ino:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install arduino-cli
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | sh
+          echo "$PWD/bin" >> "$GITHUB_PATH"
+
+      - name: Update core index & install ESP32 core
+        run: |
+          arduino-cli core update-index \
+            --additional-urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+          arduino-cli core install esp32:esp32 \
+            --additional-urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+
+      - name: Install required libraries
+        run: |
+          arduino-cli lib install "ESPAsyncWebServer"
+          arduino-cli lib install "AsyncTCP"
+          arduino-cli lib install "ArduinoJson"
+
+      # arduino-cli yêu cầu file .ino nằm trong thư mục TRÙNG TÊN với chính
+      # nó (ví dụ ESP_Code.ino phải nằm trong thư mục ESP_Code/) - repo hiện
+      # để file .ino thẳng ở root nên cần copy vào đúng cấu trúc trước.
+      - name: Prepare sketch folder
+        run: |
+          mkdir -p build_sketch/ESP_Code
+          cp ESP_Code.ino build_sketch/ESP_Code/ESP_Code.ino
+
+      - name: Compile sketch (ESP_Code.ino - Arduino framework)
+        run: |
+          arduino-cli compile \
+            --fqbn esp32:esp32:esp32 \
+            --output-dir ./build-output \
+            build_sketch/ESP_Code
+
+      - name: Upload .ino build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: esp_code_ino_build
+          path: build-output/*
