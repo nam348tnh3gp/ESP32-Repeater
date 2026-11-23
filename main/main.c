@@ -1,9 +1,15 @@
+/*
+ * APEX ULTRA - ESP-IDF NAT router (ESP32 / AP+STA + NAPT + captive portal)
+ *
+ * Logic dùng chung với bản Arduino nằm ở các header cạnh thư mục này:
+ *   apex_common.h  (kiểm tra dữ liệu, so sánh hằng thời gian, JSON escape, parse form, hysteresis RAM)
+ *   apex_dns.h     (DNS captive portal + forwarder không chặn)
+ *   apex_ui.h      (giao diện web có đăng nhập)
+ */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
-#include <ctype.h>
-#include <time.h>
-#include <strings.h>   // strncasecmp
+#include <stdbool.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -15,514 +21,149 @@
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_netif.h"
-#include "esp_chip_info.h"
-#include "esp_random.h"
 #include "esp_timer.h"
 #include "esp_http_client.h"
-#include "nvs_flash.h"
+#include "esp_http_server.h"
+#include "esp_random.h"
 #include "esp_task_wdt.h"
+#include "nvs_flash.h"
 #include "driver/gpio.h"
 
-#include "lwip/err.h"
-#include "lwip/sys.h"
-#include "lwip/tcpip.h"
-#include "lwip/netif.h"
-#include "lwip/priv/tcpip_priv.h"
-#include "lwip/etharp.h"
-#include "lwip/dns.h"
 #include "lwip/sockets.h"
-#include "lwip/netdb.h"
-#include "lwip/inet.h"
 
-#include "esp_http_server.h"
-#include "cJSON.h"
+#include "apex_common.h"
+#include "apex_dns.h"
+#include "apex_ui.h"
 
 // ================= DEFINES =================
-#define AP_SSID "APEX_ULTRA"
-#define AP_PASS "12345678"
-#define AP_CHANNEL 1
-#define AP_MAX_CONN 7
+#define AP_CHANNEL_DEFAULT   1
+#define AP_MAX_CONN_DEFAULT  7
+#define AP_MAX_CONN_LIMIT    10
 
-#define STA_SSID_CONF "sta_ssid"
-#define STA_PASS_CONF "sta_pass"
-
-#define NAT_MAX_SLOTS 512
-#define NAT_MAX_TCP 256
+#define NVS_NAMESPACE   "apex_v22"
+#define NVS_STA_SSID    "sta_ssid"
+#define NVS_STA_PASS    "sta_pass"
+#define NVS_AP_SSID     "ap_ssid"
+#define NVS_AP_PASS     "ap_pass"
+#define NVS_AP_CHANNEL  "ap_channel"
+#define NVS_MAX_CLIENTS "max_clients"
 
 #define WIFI_CONNECTED_BIT BIT0
-#define WIFI_FAIL_BIT BIT1
+#define WIFI_FAIL_BIT      BIT1
 
-#define STA_MAX_RETRY 5
+#define STA_MAX_RETRY            5
 #define STA_RECONNECT_BACKOFF_MS 30000
 
 #define WATCHDOG_TIMEOUT_S 45
 
+/* Giới hạn tần suất lệnh ghi cấu hình (đã xác thực) và chống dò mật khẩu ở /login */
 #define CONFIG_RATE_WINDOW_MS 5000
 #define CONFIG_RATE_MAX_REQ   3
+#define LOGIN_MAX_FAILS       5
+#define LOGIN_LOCKOUT_MS      60000
 
-#define SSID_BUF_LEN 33
-#define PASS_BUF_LEN 65
-#define QUERY_VALUE_LEN 96
+#define SSID_BUF_LEN   (APEX_SSID_MAX + 1)
+#define PASS_BUF_LEN   (APEX_PASS_MAX + 1)
+/* Giá trị form đã mã hoá %XX có thể dài gấp 3 lần bản giải mã */
+#define BODY_BUF_LEN   640
+#define TOKEN_LEN      32
 
 // ================= GLOBALS =================
-static const char *TAG = "APEX_ROUTER";
+static const char *TAG = "APEX";
 
 static EventGroupHandle_t wifi_event_group;
-static int s_retry_num = 0;                  // protected by sta_state_mutex
+static int  s_retry_num = 0;          // bảo vệ bởi sta_state_mutex
 static bool sta_configured = false;
-static bool sta_disconnected = true;         // protected by sta_state_mutex
+static bool sta_disconnected = true;  // bảo vệ bởi sta_state_mutex
 
 static httpd_handle_t server = NULL;
 
-static SemaphoreHandle_t state_mutex;
+static SemaphoreHandle_t state_mutex;      // nat_enabled, internet_ok, mem_pressure, last_rssi
+static SemaphoreHandle_t nvs_mutex;
+static SemaphoreHandle_t rate_limit_mutex; // bộ đếm rate-limit + khoá đăng nhập
+static SemaphoreHandle_t sta_state_mutex;
+static SemaphoreHandle_t internet_check_trigger;
+
 static bool nat_enabled = false;
-static esp_netif_t *s_ap_netif = NULL;
 static bool internet_ok = false;
-static bool internet_reachable = false;
-static int current_clients = 0;
-static int last_rssi = -100;
+static bool mem_pressure = false;
+static int  last_rssi = -100;
+
+static esp_netif_t *s_ap_netif = NULL;
+static esp_netif_t *s_sta_netif = NULL;
 
 static char sta_ssid[SSID_BUF_LEN] = {0};
 static char sta_pass[PASS_BUF_LEN] = {0};
-static char ap_ssid[SSID_BUF_LEN] = "APEX_ULTRA";
-static char ap_pass[PASS_BUF_LEN] = "12345678";
-static int32_t ap_channel = AP_CHANNEL;
-static int32_t max_clients = AP_MAX_CONN;
-
-static int32_t nat_slots = NAT_MAX_SLOTS;
-static int32_t nat_tcp = NAT_MAX_TCP;
+static char ap_ssid[SSID_BUF_LEN]  = APEX_DEFAULT_AP_SSID;
+static char ap_pass[PASS_BUF_LEN]  = APEX_DEFAULT_AP_PASS;
+static int32_t ap_channel  = AP_CHANNEL_DEFAULT;
+static int32_t max_clients = AP_MAX_CONN_DEFAULT;
 
 static nvs_handle_t s_nvs_handle;
 
-static SemaphoreHandle_t nvs_mutex;
-static SemaphoreHandle_t rate_limit_mutex;
-static SemaphoreHandle_t sta_state_mutex;  // Bảo vệ sta_disconnected, s_retry_num
-// FIX (race no-internet): đánh thức internet_check_task ngay khi STA vừa có
-// IP, thay vì để nó chờ hết chu kỳ 60s. Nếu không có fix này, một điện thoại
-// join AP ngay sau khi ESP32 vừa lên mạng sẽ nhận captive-check trả lời
-// "chưa có internet" (vì internet_ok vẫn còn false), hệ điều hành sẽ CACHE
-// lại kết luận "no internet" đó và không tự kiểm tra lại - dù vài giây sau
-// dashboard đã hiện online thật.
-static SemaphoreHandle_t internet_check_trigger;
-static char session_token[24] = {0};
-static unsigned long last_config_window_ms = 0;
-static int config_request_count = 0;       // protected by rate_limit_mutex
+static char session_token[TOKEN_LEN + 1] = {0};
+static uint32_t last_config_window_ms = 0;
+static int config_request_count = 0;
+static int login_fail_count = 0;
+static uint32_t login_lock_until_ms = 0;
 
-// ================= CAPTIVE PORTAL FIX =================
-static const char* captive_domains[] = {
-    "connectivitycheck.gstatic.com",
-    "connectivitycheck.android.com",
-    "detectportal.firefox.com",
-    "www.msftncsi.com",
-    "captive.apple.com",
-    "www.apple.com",
-    "clients3.google.com",
-    "nmcheck.gnome.org",
-    "www.google.com",
-    NULL
-};
+static esp_timer_handle_t s_restart_timer = NULL;
 
-// HTML trang chủ (giữ nguyên)
-static const char *index_html_tmpl =
-"<!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1'>"
-"<link rel='icon' href='data:,'>"
-"<title>APEX ULTRA</title>"
-"<style>"
-"*{box-sizing:border-box;}body{font-family:Arial;background:#020617;color:#f8fafc;padding:15px;max-width:480px;margin:0 auto;}"
-".card{background:#1e293b;padding:20px;margin-bottom:15px;border-radius:12px;}"
-"label{display:block;font-size:13px;color:#94a3b8;margin-top:8px;}"
-"input,select{width:100%;padding:12px;margin:4px 0;border-radius:8px;background:#0f172a;color:white;border:1px solid #334155;}"
-"input:invalid{border-color:#f87171;}"
-"button{width:100%;padding:14px;margin-top:10px;background:#38bdf8;color:#020617;border:none;border-radius:8px;font-weight:bold;cursor:pointer;}"
-"button:disabled{background:#475569;color:#94a3b8;cursor:wait;}"
-".warning{color:#f59e0b;margin-top:8px;}"
-".hint{font-size:12px;color:#64748b;margin:2px 0 0;}"
-".msg{font-size:13px;margin-top:8px;min-height:16px;}"
-".msg.ok{color:#4ade80;}.msg.err{color:#f87171;}"
-".offline{color:#f87171;}"
-"</style>"
-"</head><body>"
-"<div class='card'><h3>APEX ULTRA V22.0.2 - ESP-IDF (Fixed)</h3>"
-"<div>RAM: <b id='ram'>0</b> KB</div>"
-"<div>Internet: <span id='net'>WAIT</span></div>"
-"<div>NAT: <span id='nat'>WAIT</span></div>"
-"<div>Uplink: <span id='staStatus'>WAIT</span></div>"
-"<div>Signal: <b id='rssi'>-</b> dBm</div>"
-"<div>Clients: <b id='clientCount'>0</b> / <b id='clientLimit'>7</b></div>"
-"<div id='ctable' style='font-size:12px;margin-top:6px;'>-</div>"
-"<div id='weakWarn' class='warning' style='display:none;'>⚠️ Đang dùng mật khẩu AP mặc định — hãy đổi ngay!</div>"
-"<div id='pollErr' class='msg err' style='display:none;'>⚠️ Mất kết nối tới thiết bị — đang thử lại...</div>"
-"</div>"
-"<div class='card'><h3>Uplink Configuration</h3>"
-"<form id='staForm' action='/save-sta' method='post' class='authForm'>"
-"<label for='staSsidInp'>Tên WiFi cần kết nối</label>"
-"<input name='ssid' id='staSsidInp' placeholder='WiFi Name' required maxlength='32'>"
-"<label for='staPassInp'>Mật khẩu</label>"
-"<input name='pass' id='staPassInp' type='password' placeholder='Password' maxlength='63'>"
-"<input type='hidden' name='token' class='tokenField' value=''>"
-"<button type='submit'>Connect</button>"
-"<div class='msg' id='staMsg'></div>"
-"</form></div>"
-"<div class='card'><h3>AP Configuration</h3>"
-"<form id='apForm' action='/save-ap' method='post' class='authForm'>"
-"<label for='apSsidInp'>Tên WiFi phát ra (AP SSID)</label>"
-"<input name='ssid' id='apSsidInp' placeholder='AP SSID' maxlength='32'>"
-"<label for='apPassInp'>Mật khẩu mới (tối thiểu 8 ký tự)</label>"
-"<input name='pass' id='apPassInp' type='password' placeholder='Password (min 8)' minlength='8' maxlength='63'>"
-"<p class='hint'>Để trống nếu không muốn đổi mật khẩu.</p>"
-"<input type='hidden' name='token' class='tokenField' value=''>"
-"<button type='submit'>Save & Reboot</button>"
-"<div class='msg' id='apMsg'></div>"
-"</form></div>"
-"<div class='card'><h3>NAT Settings</h3>"
-"<form id='natForm' action='/save-nat' method='post' class='authForm'>"
-"<label for='natSlotsInp'>NAPT Slots (64-4096)</label>"
-"<input name='slots' id='natSlotsInp' type='number' min='64' max='4096' placeholder='NAPT Slots' value='512'>"
-"<label for='natTcpInp'>TCP ports (32-2048)</label>"
-"<input name='tcp' id='natTcpInp' type='number' min='32' max='2048' placeholder='TCP ports' value='256'>"
-"<input type='hidden' name='token' class='tokenField' value=''>"
-"<button type='submit'>Save & Reboot</button>"
-"<div class='msg' id='natMsg'></div>"
-"</form></div>"
-"<script>"
-"let pollFailed=0;"
-"function fetchData(){fetch('/api/status').then(r=>r.json()).then(d=>{"
-"pollFailed=0;document.getElementById('pollErr').style.display='none';"
-"document.getElementById('ram').innerText=Math.round(d.ram/1024);"
-"document.getElementById('net').innerText=d.internet?'ONLINE':'OFFLINE';"
-"document.getElementById('nat').innerText=d.nat?'ACTIVE':'OFF';"
-"document.getElementById('staStatus').innerText=d.staConnected?('Connected: '+d.staSsid):(d.staSsid?'Connecting to '+d.staSsid+'...':'Not configured');"
-"document.getElementById('rssi').innerText=d.staConnected?d.rssi:'-';"
-"document.getElementById('clientCount').innerText=d.clients;"
-"document.getElementById('weakWarn').style.display=d.weakPassword?'block':'none';"
-"}).catch(()=>{pollFailed++;if(pollFailed>=2)document.getElementById('pollErr').style.display='block';});}"
-"setInterval(fetchData,2000);fetchData();"
-"function fetchClients(){fetch('/api/clients').then(r=>r.json()).then(list=>{"
-"const el=document.getElementById('ctable');"
-"if(!list.length){el.innerHTML='<i>No clients</i>';return;}"
-"el.innerHTML=list.map(c=>`<div>• ${c.ip} <small>[${c.mac}]</small></div>`).join('');"
-"}).catch(()=>{});}"
-"setInterval(fetchClients,5000);fetchClients();"
-"function loadConfig(){fetch('/api/config').then(r=>r.json()).then(c=>{"
-"document.getElementById('apSsidInp').value=c.apSsid;"
-"if(c.staSsid){document.getElementById('staSsidInp').value=c.staSsid;}"
-"});}"
-"loadConfig();"
-"fetch('/get-token').then(r=>r.json()).then(t=>{"
-"document.querySelectorAll('.tokenField').forEach(el=>el.value=t.token);"
-"});"
-"function bindForm(formId,msgId,rebootWarn){"
-"const form=document.getElementById(formId);"
-"const msg=document.getElementById(msgId);"
-"const btn=form.querySelector('button');"
-"form.addEventListener('submit',function(ev){"
-"ev.preventDefault();"
-"btn.disabled=true;btn.innerText='Đang lưu...';"
-"msg.className='msg';msg.innerText='';"
-"fetch(form.action,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams(new FormData(form)).toString()})"
-".then(async r=>{const t=await r.text();if(r.ok){msg.className='msg ok';msg.innerText=t+(rebootWarn?' Thiết bị sẽ mất kết nối vài giây...':'');}"
-"else{msg.className='msg err';msg.innerText=t;btn.disabled=false;btn.innerText='Retry';}})"
-".catch(()=>{msg.className='msg err';msg.innerText='Không thể kết nối tới thiết bị.';btn.disabled=false;btn.innerText='Retry';});"
-"});}"
-"bindForm('staForm','staMsg',true);"
-"bindForm('apForm','apMsg',true);"
-"bindForm('natForm','natMsg',true);"
-"</script></body></html>";
+static uint32_t now_ms(void) { return (uint32_t)(esp_timer_get_time() / 1000ULL); }
 
-// ================= HÀM KIỂM TRA INTERNET =================
+// ================= STATE HELPERS =================
 static bool is_internet_available(void) {
-    bool ok;
     xSemaphoreTake(state_mutex, portMAX_DELAY);
-    ok = internet_ok;
+    bool ok = internet_ok;
     xSemaphoreGive(state_mutex);
     return ok;
 }
 
-static bool perform_internet_check(void) {
-    esp_http_client_config_t config = {
-        .url = "http://connectivitycheck.gstatic.com/generate_204",
-        .timeout_ms = 5000,
-        .method = HTTP_METHOD_GET,
-    };
-    esp_http_client_handle_t client = esp_http_client_init(&config);
-    if (client == NULL) return false;
-
-    esp_err_t err = esp_http_client_perform(client);
-    int status_code = esp_http_client_get_status_code(client);
-    esp_http_client_cleanup(client);
-
-    return (err == ESP_OK) && (status_code == 204 || status_code == 200);
+static bool get_mem_pressure(void) {
+    xSemaphoreTake(state_mutex, portMAX_DELAY);
+    bool p = mem_pressure;
+    xSemaphoreGive(state_mutex);
+    return p;
 }
 
-// ================= CAPTIVE PORTAL DNS SERVER =================
-static bool ends_with_domain(const char *qname, const char *domain) {
-    size_t qname_len = strlen(qname);
-    size_t domain_len = strlen(domain);
-    if (qname_len < domain_len) return false;
-
-    if (qname_len > 0 && qname[qname_len-1] == '.') qname_len--;
-
-    if (qname_len < domain_len) return false;
-    const char *qname_end = qname + (qname_len - domain_len);
-    return strncasecmp(qname_end, domain, domain_len) == 0;
+// ================= RESTART (không chặn luồng httpd) =================
+static void restart_cb(void *arg) {
+    (void)arg;
+    esp_restart();
 }
 
-static void dns_captive_task(void *pv) {
-    struct sockaddr_in server_addr, client_addr;
-    socklen_t addr_len = sizeof(client_addr);
-    uint8_t buffer[512];
-
-    int sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock < 0) {
-        ESP_LOGE(TAG, "DNS: Failed to create socket");
-        return;
-    }
-
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    server_addr.sin_port = htons(53);
-
-    if (bind(sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
-        ESP_LOGE(TAG, "DNS: Failed to bind to port 53");
-        close(sock);
-        return;
-    }
-
-    ESP_LOGI(TAG, "✅ DNS Captive Portal started on port 53");
-
-    while (1) {
-        int len = recvfrom(sock, buffer, sizeof(buffer), 0,
-                          (struct sockaddr *)&client_addr, &addr_len);
-        if (len > 0) {
-            if (len < 12) continue;
-
-            bool internet = is_internet_available();
-
-            if (internet) {
-                // Forward DNS query tới upstream (8.8.8.8)
-                int upstream_sock = socket(AF_INET, SOCK_DGRAM, 0);
-                if (upstream_sock < 0) {
-                    // Không tạo được socket, gửi SERVFAIL
-                    ESP_LOGE(TAG, "DNS: Failed to create upstream socket");
-                    uint8_t resp[512];
-                    memcpy(resp, buffer, len);
-                    resp[2] = 0x81;  // QR=1, RD=1
-                    resp[3] = 0x80;  // RA=1, RCODE=2 (SERVFAIL)
-                    memset(resp + 4, 0, 8);
-                    sendto(sock, resp, len, 0,
-                           (struct sockaddr *)&client_addr, addr_len);
-                } else {
-                    struct sockaddr_in upstream_addr;
-                    upstream_addr.sin_family = AF_INET;
-                    upstream_addr.sin_port = htons(53);
-                    upstream_addr.sin_addr.s_addr = inet_addr("8.8.8.8");
-
-                    int sent = sendto(upstream_sock, buffer, len, 0,
-                                      (struct sockaddr *)&upstream_addr, sizeof(upstream_addr));
-                    if (sent >= 0) {
-                        struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
-                        setsockopt(upstream_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
-                        uint8_t upstream_resp[512];
-                        int up_len = recv(upstream_sock, upstream_resp, sizeof(upstream_resp), 0);
-                        if (up_len > 0) {
-                            sendto(sock, upstream_resp, up_len, 0,
-                                   (struct sockaddr *)&client_addr, addr_len);
-                        } else {
-                            // Không nhận được phản hồi -> gửi SERVFAIL
-                            uint8_t resp[512];
-                            memcpy(resp, buffer, len);
-                            resp[2] = 0x81;
-                            resp[3] = 0x80;
-                            memset(resp + 4, 0, 8);
-                            sendto(sock, resp, len, 0,
-                                   (struct sockaddr *)&client_addr, addr_len);
-                        }
-                    } else {
-                        ESP_LOGW(TAG, "DNS: sendto upstream failed");
-                        uint8_t resp[512];
-                        memcpy(resp, buffer, len);
-                        resp[2] = 0x81;
-                        resp[3] = 0x80;
-                        memset(resp + 4, 0, 8);
-                        sendto(sock, resp, len, 0,
-                               (struct sockaddr *)&client_addr, addr_len);
-                    }
-                    close(upstream_sock);
-                }
-            } else {
-                // Chưa có Internet: chỉ giả mạo cho domain captive detection
-                // Parse QNAME an toàn
-                char qname[256] = {0};
-                int qname_len = 0;
-                int pos = 12;
-                bool parse_ok = true;
-                bool compressed = false;
-                while (pos < len && buffer[pos] != 0) {
-                    uint8_t label_len = buffer[pos];
-                    if ((label_len & 0xC0) == 0xC0) {
-                        compressed = true;
-                        break;
-                    }
-                    pos++;
-                    if (pos + label_len > len) {
-                        parse_ok = false;
-                        break;
-                    }
-                    for (int i = 0; i < label_len; i++) {
-                        if (qname_len < sizeof(qname) - 1) {
-                            qname[qname_len++] = buffer[pos++];
-                        } else {
-                            parse_ok = false;
-                            break;
-                        }
-                    }
-                    if (!parse_ok) break;
-                    if (qname_len < sizeof(qname) - 1) {
-                        qname[qname_len++] = '.';
-                    }
-                }
-                if (!parse_ok || compressed || qname_len == 0) {
-                    continue;
-                }
-                qname[qname_len] = '\0';
-
-                bool is_captive_domain = false;
-                for (int i = 0; captive_domains[i] != NULL; i++) {
-                    if (ends_with_domain(qname, captive_domains[i])) {
-                        is_captive_domain = true;
-                        break;
-                    }
-                }
-
-                if (is_captive_domain) {
-                    uint8_t response[512];
-                    memcpy(response, buffer, len);
-                    response[2] = 0x85;  // QR=1, AA=1
-                    response[3] = 0x80;  // RA=1
-                    memset(response + 4, 0, 8);
-                    response[6] = 0x00;
-                    response[7] = 0x01;  // ANCOUNT = 1
-
-                    int qname_start = 12;
-                    int qname_end = qname_start;
-                    bool qname_has_compression = false;
-                    while (qname_end < len && buffer[qname_end] != 0) {
-                        uint8_t label_len = buffer[qname_end];
-                        if ((label_len & 0xC0) == 0xC0) {
-                            qname_has_compression = true;
-                            break;
-                        }
-                        if (qname_end + 1 + label_len > len) {
-                            break;
-                        }
-                        qname_end += 1 + label_len;
-                    }
-                    if (qname_has_compression || qname_end >= len || buffer[qname_end] != 0) {
-                        continue; // Bỏ qua gói tin nếu có nén hoặc không tìm thấy byte kết thúc
-                    }
-
-                    int off = qname_end + 1 + 4;  // sau QNAME + QTYPE + QCLASS
-                    if (off > len) {
-                        // Question không đầy đủ, bỏ qua
-                        continue;
-                    }
-                    if (off + 16 > (int)sizeof(response)) continue;
-
-                    response[off++] = 0xC0;
-                    response[off++] = 0x0C;
-                    response[off++] = 0x00;
-                    response[off++] = 0x01;  // Type A
-                    response[off++] = 0x00;
-                    response[off++] = 0x01;  // Class IN
-                    response[off++] = 0x00;
-                    response[off++] = 0x00;
-                    response[off++] = 0x00;
-                    response[off++] = 0x3C;  // TTL
-                    response[off++] = 0x00;
-                    response[off++] = 0x04;
-                    response[off++] = 192;
-                    response[off++] = 168;
-                    response[off++] = 4;
-                    response[off++] = 1;
-
-                    sendto(sock, response, off, 0,
-                           (struct sockaddr *)&client_addr, addr_len);
-                } else {
-                    uint8_t resp[512];
-                    memcpy(resp, buffer, len);
-                    resp[2] = 0x81;
-                    resp[3] = 0x83;
-                    memset(resp + 4, 0, 8);
-                    sendto(sock, resp, len, 0,
-                           (struct sockaddr *)&client_addr, addr_len);
-                }
-            }
-        }
-        vTaskDelay(pdMS_TO_TICKS(1));
-    }
-    close(sock);
-}
-
-// ================= CAPTIVE PORTAL HTTP HANDLERS =================
-static esp_err_t captive_204_handler(httpd_req_t *req) {
-    if (is_internet_available()) {
-        httpd_resp_set_status(req, "204 No Content");
-        httpd_resp_send(req, NULL, 0);
-    } else {
-        httpd_resp_set_status(req, "302 Found");
-        httpd_resp_set_hdr(req, "Location", "http://192.168.4.1/");
-        httpd_resp_send(req, NULL, 0);
-    }
-    return ESP_OK;
-}
-
-static esp_err_t captive_success_handler(httpd_req_t *req) {
-    if (is_internet_available()) {
-        httpd_resp_set_status(req, "404 Not Found");
-        httpd_resp_send(req, NULL, 0);
-    } else {
-        httpd_resp_set_status(req, "302 Found");
-        httpd_resp_set_hdr(req, "Location", "http://192.168.4.1/");
-        httpd_resp_send(req, NULL, 0);
-    }
-    return ESP_OK;
-}
-
-// ================= UTILITY FUNCTIONS =================
-static void url_decode(char *dst, size_t dst_size, const char *src) {
-    if (dst_size == 0) return;
-    size_t out = 0;
-    while (*src && out + 1 < dst_size) {
-        char a, b;
-        if ((*src == '%') && (a = src[1]) && (b = src[2]) &&
-            isxdigit((unsigned char)a) && isxdigit((unsigned char)b)) {
-            if (a >= 'a') a -= 'a' - 'A';
-            if (a >= 'A') a -= ('A' - 10);
-            else a -= '0';
-            if (b >= 'a') b -= 'a' - 'A';
-            if (b >= 'A') b -= ('A' - 10);
-            else b -= '0';
-            dst[out++] = (char)((a << 4) | b);
-            src += 3;
-        } else if (*src == '+') {
-            dst[out++] = ' ';
-            src++;
-        } else {
-            dst[out++] = *src++;
+static void schedule_restart(uint32_t delay_ms) {
+    if (s_restart_timer == NULL) {
+        const esp_timer_create_args_t args = { .callback = restart_cb, .name = "apex_restart" };
+        if (esp_timer_create(&args, &s_restart_timer) != ESP_OK) {
+            esp_restart();
+            return;
         }
     }
-    dst[out] = '\0';
+    esp_timer_stop(s_restart_timer);  // an toàn nếu chưa chạy
+    esp_timer_start_once(s_restart_timer, (uint64_t)delay_ms * 1000ULL);
 }
 
-static void save_config(void) {
+// ================= CONFIG (NVS) =================
+static void copy_str(char *dst, size_t dst_sz, const char *src) {
+    strncpy(dst, src, dst_sz - 1);
+    dst[dst_sz - 1] = '\0';
+}
+
+static void save_ap_config(void) {
     xSemaphoreTake(nvs_mutex, portMAX_DELAY);
-    nvs_set_str(s_nvs_handle, "ap_ssid", ap_ssid);
-    nvs_set_str(s_nvs_handle, "ap_pass", ap_pass);
-    nvs_set_i32(s_nvs_handle, "ap_channel", ap_channel);
-    nvs_set_i32(s_nvs_handle, "max_clients", max_clients);
-    nvs_set_i32(s_nvs_handle, "nat_slots", nat_slots);
-    nvs_set_i32(s_nvs_handle, "nat_tcp", nat_tcp);
+    nvs_set_str(s_nvs_handle, NVS_AP_SSID, ap_ssid);
+    nvs_set_str(s_nvs_handle, NVS_AP_PASS, ap_pass);
+    nvs_set_i32(s_nvs_handle, NVS_AP_CHANNEL, ap_channel);
+    nvs_set_i32(s_nvs_handle, NVS_MAX_CLIENTS, max_clients);
+    nvs_commit(s_nvs_handle);
+    xSemaphoreGive(nvs_mutex);
+}
+
+static void save_sta_config(const char *ssid, const char *pass) {
+    xSemaphoreTake(nvs_mutex, portMAX_DELAY);
+    nvs_set_str(s_nvs_handle, NVS_STA_SSID, ssid);
+    nvs_set_str(s_nvs_handle, NVS_STA_PASS, pass);
     nvs_commit(s_nvs_handle);
     xSemaphoreGive(nvs_mutex);
 }
@@ -531,38 +172,34 @@ static void load_config(void) {
     size_t len;
 
     len = sizeof(ap_ssid);
-    if (nvs_get_str(s_nvs_handle, "ap_ssid", ap_ssid, &len) != ESP_OK) {
-        strncpy(ap_ssid, AP_SSID, sizeof(ap_ssid) - 1);
+    if (nvs_get_str(s_nvs_handle, NVS_AP_SSID, ap_ssid, &len) != ESP_OK || !apex_valid_ssid(ap_ssid)) {
+        copy_str(ap_ssid, sizeof(ap_ssid), APEX_DEFAULT_AP_SSID);
     }
 
     len = sizeof(ap_pass);
-    if (nvs_get_str(s_nvs_handle, "ap_pass", ap_pass, &len) != ESP_OK) {
-        strncpy(ap_pass, AP_PASS, sizeof(ap_pass) - 1);
+    if (nvs_get_str(s_nvs_handle, NVS_AP_PASS, ap_pass, &len) != ESP_OK || !apex_valid_wpa_pass(ap_pass)) {
+        copy_str(ap_pass, sizeof(ap_pass), APEX_DEFAULT_AP_PASS);
     }
 
-    nvs_get_i32(s_nvs_handle, "ap_channel", &ap_channel);
-    if (ap_channel < 1 || ap_channel > 13) ap_channel = AP_CHANNEL;
+    nvs_get_i32(s_nvs_handle, NVS_AP_CHANNEL, &ap_channel);
+    if (ap_channel < 1 || ap_channel > 13) ap_channel = AP_CHANNEL_DEFAULT;
 
-    nvs_get_i32(s_nvs_handle, "max_clients", &max_clients);
-    if (max_clients < 1 || max_clients > 10) max_clients = AP_MAX_CONN;
-
-    nvs_get_i32(s_nvs_handle, "nat_slots", &nat_slots);
-    if (nat_slots < 64 || nat_slots > 4096) nat_slots = NAT_MAX_SLOTS;
-
-    nvs_get_i32(s_nvs_handle, "nat_tcp", &nat_tcp);
-    if (nat_tcp < 32 || nat_tcp > 2048) nat_tcp = NAT_MAX_TCP;
-    if (nat_slots < nat_tcp) nat_slots = nat_tcp;
+    nvs_get_i32(s_nvs_handle, NVS_MAX_CLIENTS, &max_clients);
+    if (max_clients < 1 || max_clients > AP_MAX_CONN_LIMIT) max_clients = AP_MAX_CONN_DEFAULT;
 
     len = sizeof(sta_ssid);
-    nvs_get_str(s_nvs_handle, STA_SSID_CONF, sta_ssid, &len);
-
+    if (nvs_get_str(s_nvs_handle, NVS_STA_SSID, sta_ssid, &len) != ESP_OK || !apex_valid_ssid(sta_ssid)) {
+        sta_ssid[0] = '\0';
+    }
     len = sizeof(sta_pass);
-    nvs_get_str(s_nvs_handle, STA_PASS_CONF, sta_pass, &len);
-
-    sta_configured = (strlen(sta_ssid) > 0);
+    if (nvs_get_str(s_nvs_handle, NVS_STA_PASS, sta_pass, &len) != ESP_OK) {
+        sta_pass[0] = '\0';
+    }
+    sta_configured = (sta_ssid[0] != '\0');
 }
 
-// ================= NAT FUNCTIONS =================
+// ================= NAT =================
+// Kích thước bảng NAPT do cấu hình SDK (sdkconfig / lwIP) quyết định, không chỉnh được lúc chạy.
 static bool enable_nat(void) {
     xSemaphoreTake(state_mutex, portMAX_DELAY);
     bool already = nat_enabled;
@@ -570,7 +207,7 @@ static bool enable_nat(void) {
     if (already) return true;
 
     if (s_ap_netif == NULL) {
-        ESP_LOGE(TAG, "enable_nat: AP netif chưa được khởi tạo");
+        ESP_LOGE(TAG, "enable_nat: AP netif chưa khởi tạo");
         return false;
     }
     esp_err_t err = esp_netif_napt_enable(s_ap_netif);
@@ -578,11 +215,10 @@ static bool enable_nat(void) {
         ESP_LOGE(TAG, "esp_netif_napt_enable failed: %s", esp_err_to_name(err));
         return false;
     }
-
     xSemaphoreTake(state_mutex, portMAX_DELAY);
     nat_enabled = true;
     xSemaphoreGive(state_mutex);
-    ESP_LOGI(TAG, "NAT enabled (slots=%d, tcp=%d)", (int)nat_slots, (int)nat_tcp);
+    ESP_LOGI(TAG, "NAT enabled");
     return true;
 }
 
@@ -598,16 +234,84 @@ static void disable_nat(void) {
             ESP_LOGE(TAG, "esp_netif_napt_disable failed: %s", esp_err_to_name(err));
         }
     }
-
     xSemaphoreTake(state_mutex, portMAX_DELAY);
     nat_enabled = false;
     xSemaphoreGive(state_mutex);
     ESP_LOGI(TAG, "NAT disabled");
 }
 
+// ================= KIỂM TRA INTERNET =================
+// Chỉ coi là online khi nhận đúng 204. Không theo redirect: captive portal của mạng uplink
+// thường trả 302 -> 200 và trước đây bị nhận nhầm là "có internet".
+static bool perform_internet_check(void) {
+    esp_http_client_config_t config = {
+        .url = "http://connectivitycheck.gstatic.com/generate_204",
+        .timeout_ms = 5000,
+        .method = HTTP_METHOD_GET,
+        .disable_auto_redirect = true,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (client == NULL) return false;
+
+    esp_err_t err = esp_http_client_perform(client);
+    int status_code = esp_http_client_get_status_code(client);
+    esp_http_client_cleanup(client);
+
+    return (err == ESP_OK) && (status_code == 204);
+}
+
+// ================= DNS CAPTIVE PORTAL (apex_dns.h) =================
+static int dns_cb_internet(void *ctx) { (void)ctx; return is_internet_available() ? 1 : 0; }
+
+static uint32_t dns_cb_upstream(void *ctx) {
+    (void)ctx;
+    esp_netif_dns_info_t d;
+    if (s_sta_netif != NULL &&
+        esp_netif_get_dns_info(s_sta_netif, ESP_NETIF_DNS_MAIN, &d) == ESP_OK &&
+        d.ip.type == ESP_IPADDR_TYPE_V4) {
+        return d.ip.u_addr.ip4.addr;
+    }
+    return 0;
+}
+
+static uint32_t dns_cb_rand(void) { return esp_random(); }
+static void dns_cb_wdt(void) { esp_task_wdt_reset(); }
+static void dns_cb_log(const char *m) { ESP_LOGI(TAG, "%s", m); }
+
+static void dns_captive_task(void *pv) {
+    (void)pv;
+    esp_task_wdt_add(NULL);
+    for (;;) {
+        esp_netif_ip_info_t ip;
+        if (s_ap_netif == NULL || esp_netif_get_ip_info(s_ap_netif, &ip) != ESP_OK || ip.ip.addr == 0) {
+            esp_task_wdt_reset();
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+        apex_dns_cfg_t cfg;
+        memset(&cfg, 0, sizeof(cfg));
+        cfg.port = 53;
+        cfg.bind_addr = ip.ip.addr;              // chỉ lắng nghe trên IP của AP
+        memcpy(cfg.ap_ip, &ip.ip.addr, 4);
+        cfg.internet_ok = dns_cb_internet;
+        cfg.upstream_ip = dns_cb_upstream;
+        cfg.rand32 = dns_cb_rand;
+        cfg.wdt_kick = dns_cb_wdt;
+        cfg.log = dns_cb_log;
+
+        int r = apex_dns_run(&cfg);               // chỉ trả về khi lỗi socket
+        ESP_LOGE(TAG, "DNS server dừng (%d), thử lại sau 2s", r);
+        for (int i = 0; i < 4; i++) {
+            esp_task_wdt_reset();
+            vTaskDelay(pdMS_TO_TICKS(500));
+        }
+    }
+}
+
 // ================= WIFI EVENT HANDLER =================
 static void wifi_event_handler(void *arg, esp_event_base_t event_base,
-                                int32_t event_id, void *event_data) {
+                               int32_t event_id, void *event_data) {
+    (void)arg;
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         if (sta_configured) esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
@@ -618,33 +322,21 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
             s_retry_num++;
             should_retry = true;
         }
+        int retry = s_retry_num;
         xSemaphoreGive(sta_state_mutex);
 
+        xEventGroupClearBits(wifi_event_group, WIFI_CONNECTED_BIT);
         if (should_retry) {
             esp_wifi_connect();
-            ESP_LOGI(TAG, "Retry connecting... (%d/%d)", s_retry_num, STA_MAX_RETRY);
+            ESP_LOGI(TAG, "Retry connecting... (%d/%d)", retry, STA_MAX_RETRY);
         } else {
             xEventGroupSetBits(wifi_event_group, WIFI_FAIL_BIT);
-            ESP_LOGW(TAG, "STA retry exhausted, will retry again in background every %d s",
-                     STA_RECONNECT_BACKOFF_MS / 1000);
+            ESP_LOGW(TAG, "STA retry exhausted, background retry every %d s", STA_RECONNECT_BACKOFF_MS / 1000);
         }
         disable_nat();
         xSemaphoreTake(state_mutex, portMAX_DELAY);
         internet_ok = false;
         xSemaphoreGive(state_mutex);
-        ESP_LOGI(TAG, "STA disconnected");
-    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_STACONNECTED) {
-        xSemaphoreTake(state_mutex, portMAX_DELAY);
-        current_clients++;
-        int c = current_clients;
-        xSemaphoreGive(state_mutex);
-        ESP_LOGI(TAG, "Client connected: %d/%d", c, (int)max_clients);
-    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_STADISCONNECTED) {
-        xSemaphoreTake(state_mutex, portMAX_DELAY);
-        if (current_clients > 0) current_clients--;
-        int c = current_clients;
-        xSemaphoreGive(state_mutex);
-        ESP_LOGI(TAG, "Client disconnected: %d/%d", c, (int)max_clients);
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
@@ -654,16 +346,13 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         xSemaphoreGive(sta_state_mutex);
         xEventGroupClearBits(wifi_event_group, WIFI_FAIL_BIT);
         xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
-        // FIX (race no-internet): vừa có IP thì đánh thức internet_check_task
-        // kiểm tra NGAY, không chờ chu kỳ định kỳ tiếp theo.
-        if (internet_check_trigger != NULL) {
-            xSemaphoreGive(internet_check_trigger);
-        }
+        // Đánh thức internet_check_task ngay, tránh điện thoại cache kết luận "no internet".
+        if (internet_check_trigger != NULL) xSemaphoreGive(internet_check_trigger);
     }
 }
 
-// ================= TASK NỀN KẾT NỐI LẠI STA =================
 static void sta_reconnect_task(void *pv) {
+    (void)pv;
     esp_task_wdt_add(NULL);
     for (;;) {
         esp_task_wdt_reset();
@@ -672,17 +361,14 @@ static void sta_reconnect_task(void *pv) {
         xSemaphoreTake(sta_state_mutex, portMAX_DELAY);
         if (sta_configured && !(bits & WIFI_CONNECTED_BIT) && sta_disconnected) {
             should_connect = true;
-            // Đánh dấu là đang kết nối để tránh gọi lặp
-            sta_disconnected = false;
-            // Không đặt lại s_retry_num ở đây để giữ nguyên logic retry ban đầu
-            // s_retry_num = 0;
+            sta_disconnected = false;   // tránh gọi lặp
         }
         xSemaphoreGive(sta_state_mutex);
 
         if (should_connect) {
             ESP_LOGI(TAG, "Background STA reconnect attempt...");
             esp_err_t err = esp_wifi_connect();
-            if (err != ESP_OK) {
+            if (err != ESP_OK && err != ESP_ERR_WIFI_CONN) {
                 xSemaphoreTake(sta_state_mutex, portMAX_DELAY);
                 sta_disconnected = true;
                 xSemaphoreGive(sta_state_mutex);
@@ -700,56 +386,43 @@ static void wifi_init(void) {
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     s_ap_netif = esp_netif_create_default_wifi_ap();
-    esp_netif_create_default_wifi_sta();
+    s_sta_netif = esp_netif_create_default_wifi_sta();
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    // Cấu hình WiFi do ứng dụng tự quản lý trong NVS => không để driver ghi thêm vào flash.
+    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
 
     esp_event_handler_instance_t instance_any_id;
     esp_event_handler_instance_t instance_got_ip;
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
-                                                        ESP_EVENT_ANY_ID,
-                                                        &wifi_event_handler,
-                                                        NULL,
-                                                        &instance_any_id));
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
-                                                        IP_EVENT_STA_GOT_IP,
-                                                        &wifi_event_handler,
-                                                        NULL,
-                                                        &instance_got_ip));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
+                                                        &wifi_event_handler, NULL, &instance_any_id));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
+                                                        &wifi_event_handler, NULL, &instance_got_ip));
 
     wifi_config_t ap_config = {
         .ap = {
             .ssid = "",
             .password = "",
             .ssid_len = 0,
-            .channel = ap_channel,
-            .max_connection = max_clients,
-            .authmode = WIFI_AUTH_WPA_WPA2_PSK,
-            .pmf_cfg = {
-                .required = false,
-            },
+            .channel = (uint8_t)ap_channel,
+            .max_connection = (uint8_t)max_clients,
+            .authmode = WIFI_AUTH_WPA2_PSK,   // bỏ WPA1 (WPA_WPA2_PSK) vốn yếu
+            .pmf_cfg = { .capable = true, .required = false },
         },
     };
-    strncpy((char *)ap_config.ap.ssid, ap_ssid, sizeof(ap_config.ap.ssid) - 1);
-    strncpy((char *)ap_config.ap.password, ap_pass, sizeof(ap_config.ap.password) - 1);
-    if (strlen(ap_pass) == 0) {
-        ap_config.ap.authmode = WIFI_AUTH_OPEN;
-    }
+    copy_str((char *)ap_config.ap.ssid, sizeof(ap_config.ap.ssid), ap_ssid);
+    copy_str((char *)ap_config.ap.password, sizeof(ap_config.ap.password), ap_pass);
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));
 
-    if (strlen(sta_ssid) > 0) {
-        wifi_config_t sta_config = {
-            .sta = {
-                .ssid = "",
-                .password = "",
-                .threshold.authmode = WIFI_AUTH_WPA2_PSK,
-            },
-        };
-        strncpy((char *)sta_config.sta.ssid, sta_ssid, sizeof(sta_config.sta.ssid) - 1);
-        strncpy((char *)sta_config.sta.password, sta_pass, sizeof(sta_config.sta.password) - 1);
+    if (sta_configured) {
+        wifi_config_t sta_config = { 0 };
+        copy_str((char *)sta_config.sta.ssid, sizeof(sta_config.sta.ssid), sta_ssid);
+        copy_str((char *)sta_config.sta.password, sizeof(sta_config.sta.password), sta_pass);
+        // Mạng uplink không mật khẩu: nếu để ngưỡng WPA2 thì không bao giờ kết nối được.
+        sta_config.sta.threshold.authmode = (sta_pass[0] == '\0') ? WIFI_AUTH_OPEN : WIFI_AUTH_WPA2_PSK;
         ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_config));
     }
 
@@ -757,21 +430,53 @@ static void wifi_init(void) {
     ESP_LOGI(TAG, "WiFi started. AP: %s on channel %d", ap_ssid, (int)ap_channel);
 }
 
-// ================= AUTH / RATE LIMIT =================
+// ================= HTTP HELPERS =================
+static esp_err_t send_text(httpd_req_t *req, const char *status, const char *msg) {
+    httpd_resp_set_status(req, status);
+    httpd_resp_set_type(req, "text/plain; charset=utf-8");
+    return httpd_resp_send(req, msg, HTTPD_RESP_USE_STRLEN);
+}
+
+// Chỉ phục vụ kết nối đến địa chỉ IP của AP; chặn truy cập từ phía mạng uplink (STA).
+static bool request_on_ap_side(httpd_req_t *req) {
+    int fd = httpd_req_to_sockfd(req);
+    if (fd < 0 || s_ap_netif == NULL) return false;
+    struct sockaddr_in local;
+    socklen_t l = sizeof(local);
+    if (getsockname(fd, (struct sockaddr *)&local, &l) != 0 || local.sin_family != AF_INET) return false;
+    esp_netif_ip_info_t ip;
+    if (esp_netif_get_ip_info(s_ap_netif, &ip) != ESP_OK) return false;
+    return local.sin_addr.s_addr == ip.ip.addr;
+}
+
+#define REQUIRE_AP_SIDE(req)                                         \
+    do {                                                             \
+        if (!request_on_ap_side(req)) {                              \
+            send_text(req, "403 Forbidden", "Forbidden");            \
+            return ESP_OK;                                           \
+        }                                                            \
+    } while (0)
+
+// Đọc body POST với giới hạn kích thước và thời gian (trước đây vòng lặp timeout là vô hạn).
 static bool read_post_body(httpd_req_t *req, char *buf, size_t buf_size) {
-    int total_len = req->content_len;
+    int total_len = (int)req->content_len;
     if (total_len <= 0 || (size_t)total_len >= buf_size) {
-        httpd_resp_set_status(req, "400 Bad Request");
-        httpd_resp_send(req, "Invalid or too large request body", HTTPD_RESP_USE_STRLEN);
+        send_text(req, "400 Bad Request", "Yêu cầu không hợp lệ hoặc quá lớn");
         return false;
     }
     int received = 0;
+    int timeouts = 0;
     while (received < total_len) {
-        int ret = httpd_req_recv(req, buf + received, total_len - received);
-        if (ret == HTTPD_SOCK_ERR_TIMEOUT) continue;
+        int ret = httpd_req_recv(req, buf + received, (size_t)(total_len - received));
+        if (ret == HTTPD_SOCK_ERR_TIMEOUT) {
+            if (++timeouts >= 3) {
+                httpd_resp_send_err(req, HTTPD_408_REQ_TIMEOUT, "Hết thời gian nhận dữ liệu");
+                return false;
+            }
+            continue;
+        }
         if (ret <= 0) {
-            httpd_resp_set_status(req, "400 Bad Request");
-            httpd_resp_send(req, "Failed to read request body", HTTPD_RESP_USE_STRLEN);
+            send_text(req, "400 Bad Request", "Không đọc được dữ liệu");
             return false;
         }
         received += ret;
@@ -780,31 +485,27 @@ static bool read_post_body(httpd_req_t *req, char *buf, size_t buf_size) {
     return true;
 }
 
+// Token + giới hạn tần suất cho các lệnh ghi cấu hình.
 static bool check_auth_and_rate(const char *body, httpd_req_t *req) {
-    char token[24] = {0};
-    bool has_token = httpd_query_key_value(body, "token", token, sizeof(token)) == ESP_OK;
-
-    if (!has_token || strcmp(token, session_token) != 0) {
-        httpd_resp_set_status(req, "401 Unauthorized");
-        httpd_resp_send(req, "Unauthorized: missing/invalid token", HTTPD_RESP_USE_STRLEN);
+    char token[TOKEN_LEN + 8];
+    int r = apex_form_get(body, "token", token, sizeof(token));
+    if (r != 1 || !apex_ct_equal(token, session_token)) {
+        send_text(req, "401 Unauthorized", "Chưa đăng nhập hoặc token không hợp lệ");
         return false;
     }
 
     xSemaphoreTake(rate_limit_mutex, portMAX_DELAY);
-
-    unsigned long now = (unsigned long)(esp_timer_get_time() / 1000ULL);
-    if (now - last_config_window_ms > CONFIG_RATE_WINDOW_MS) {
+    uint32_t now = now_ms();
+    if ((uint32_t)(now - last_config_window_ms) > CONFIG_RATE_WINDOW_MS) {
         last_config_window_ms = now;
         config_request_count = 0;
     }
     config_request_count++;
     bool rate_ok = (config_request_count <= CONFIG_RATE_MAX_REQ);
-
     xSemaphoreGive(rate_limit_mutex);
 
     if (!rate_ok) {
-        httpd_resp_set_status(req, "429 Too Many Requests");
-        httpd_resp_send(req, "Too many requests, slow down", HTTPD_RESP_USE_STRLEN);
+        send_text(req, "429 Too Many Requests", "Quá nhiều yêu cầu, vui lòng thử lại sau");
         return false;
     }
     return true;
@@ -812,368 +513,310 @@ static bool check_auth_and_rate(const char *body, httpd_req_t *req) {
 
 // ================= HTTP HANDLERS =================
 static esp_err_t root_get_handler(httpd_req_t *req) {
-    httpd_resp_set_type(req, "text/html");
-    return httpd_resp_send(req, index_html_tmpl, strlen(index_html_tmpl));
+    REQUIRE_AP_SIDE(req);
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
+    return httpd_resp_send(req, APEX_INDEX_HTML, HTTPD_RESP_USE_STRLEN);
 }
 
-static esp_err_t token_get_handler(httpd_req_t *req) {
-    char buffer[48];
-    snprintf(buffer, sizeof(buffer), "{\"token\":\"%s\"}", session_token);
+// POST /login  (pass=<mật khẩu AP>)  ->  {"token":"..."}
+static esp_err_t login_post_handler(httpd_req_t *req) {
+    REQUIRE_AP_SIDE(req);
+
+    xSemaphoreTake(rate_limit_mutex, portMAX_DELAY);
+    uint32_t now = now_ms();
+    bool locked = (login_lock_until_ms != 0) && ((int32_t)(login_lock_until_ms - now) > 0);
+    uint32_t wait_s = locked ? (login_lock_until_ms - now) / 1000 + 1 : 0;
+    xSemaphoreGive(rate_limit_mutex);
+    if (locked) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "Sai quá nhiều lần. Thử lại sau %u giây", (unsigned)wait_s);
+        return send_text(req, "429 Too Many Requests", msg);
+    }
+
+    char body[BODY_BUF_LEN / 2];
+    if (!read_post_body(req, body, sizeof(body))) return ESP_OK;
+
+    char pass[PASS_BUF_LEN + 8];
+    bool ok = (apex_form_get(body, "pass", pass, sizeof(pass)) == 1) && apex_ct_equal(pass, ap_pass);
+
+    xSemaphoreTake(rate_limit_mutex, portMAX_DELAY);
+    if (ok) {
+        login_fail_count = 0;
+        login_lock_until_ms = 0;
+    } else if (++login_fail_count >= LOGIN_MAX_FAILS) {
+        login_fail_count = 0;
+        login_lock_until_ms = now_ms() + LOGIN_LOCKOUT_MS;
+        if (login_lock_until_ms == 0) login_lock_until_ms = 1;
+    }
+    xSemaphoreGive(rate_limit_mutex);
+
+    if (!ok) return send_text(req, "401 Unauthorized", "Sai mật khẩu");
+
+    char out[64];
+    snprintf(out, sizeof(out), "{\"token\":\"%s\"}", session_token);
     httpd_resp_set_type(req, "application/json");
-    return httpd_resp_send(req, buffer, strlen(buffer));
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    return httpd_resp_send(req, out, HTTPD_RESP_USE_STRLEN);
 }
 
 static esp_err_t status_get_handler(httpd_req_t *req) {
-    char buffer[400];
+    REQUIRE_AP_SIDE(req);
+
     uint32_t free_heap = esp_get_free_heap_size();
 
     xSemaphoreTake(state_mutex, portMAX_DELAY);
     bool nat_e = nat_enabled;
     bool inet = internet_ok;
-    int clients = current_clients;
+    bool memlow = mem_pressure;
     int rssi = last_rssi;
     xSemaphoreGive(state_mutex);
 
+    wifi_sta_list_t sta_list;
+    int clients = (esp_wifi_ap_get_sta_list(&sta_list) == ESP_OK) ? sta_list.num : 0;
     bool sta_connected = (xEventGroupGetBits(wifi_event_group) & WIFI_CONNECTED_BIT) != 0;
 
+    char ssid_esc[SSID_BUF_LEN * 6 + 1];
+    apex_json_escape(ssid_esc, sizeof(ssid_esc), sta_ssid);
+
+    char buffer[512];
     snprintf(buffer, sizeof(buffer),
-        "{\"ram\":%lu,\"internet\":%s,\"nat\":%s,\"clients\":%d,\"rssi\":%d,"
-        "\"staConnected\":%s,\"staSsid\":\"%s\",\"weakPassword\":%s}",
+        "{\"ram\":%lu,\"internet\":%s,\"nat\":%s,\"memLow\":%s,\"clients\":%d,\"clientLimit\":%d,"
+        "\"rssi\":%d,\"staConnected\":%s,\"staSsid\":\"%s\",\"weakPassword\":%s}",
         (unsigned long)free_heap,
         inet ? "true" : "false",
         nat_e ? "true" : "false",
-        clients,
+        memlow ? "true" : "false",
+        clients, (int)max_clients,
         rssi,
         sta_connected ? "true" : "false",
-        sta_ssid,
-        (strcmp(ap_pass, "12345678") == 0) ? "true" : "false");
+        ssid_esc,
+        apex_ct_equal(ap_pass, APEX_DEFAULT_AP_PASS) ? "true" : "false");
 
     httpd_resp_set_type(req, "application/json");
-    return httpd_resp_send(req, buffer, strlen(buffer));
+    return httpd_resp_send(req, buffer, HTTPD_RESP_USE_STRLEN);
 }
 
 static esp_err_t config_get_handler(httpd_req_t *req) {
-    char buffer[200];
-    snprintf(buffer, sizeof(buffer),
-        "{\"apSsid\":\"%s\",\"staSsid\":\"%s\"}",
-        ap_ssid, sta_ssid);
+    REQUIRE_AP_SIDE(req);
+    char a[SSID_BUF_LEN * 6 + 1], s[SSID_BUF_LEN * 6 + 1];
+    apex_json_escape(a, sizeof(a), ap_ssid);
+    apex_json_escape(s, sizeof(s), sta_ssid);
+    char buffer[2 * (SSID_BUF_LEN * 6 + 1) + 48];
+    snprintf(buffer, sizeof(buffer), "{\"apSsid\":\"%s\",\"staSsid\":\"%s\"}", a, s);
     httpd_resp_set_type(req, "application/json");
-    return httpd_resp_send(req, buffer, strlen(buffer));
+    return httpd_resp_send(req, buffer, HTTPD_RESP_USE_STRLEN);
 }
 
 static esp_err_t clients_get_handler(httpd_req_t *req) {
+    REQUIRE_AP_SIDE(req);
+    httpd_resp_set_type(req, "application/json");
+
     wifi_sta_list_t sta_list;
     if (esp_wifi_ap_get_sta_list(&sta_list) != ESP_OK || s_ap_netif == NULL) {
-        httpd_resp_set_type(req, "application/json");
         return httpd_resp_send(req, "[]", HTTPD_RESP_USE_STRLEN);
     }
-
     int num = sta_list.num;
     if (num > 10) num = 10;
 
-    esp_netif_pair_mac_ip_t pairs[10] = {0};
-    for (int i = 0; i < num; i++) {
-        memcpy(pairs[i].mac, sta_list.sta[i].mac, 6);
-    }
-    esp_netif_dhcps_get_clients_by_mac(s_ap_netif, num, pairs);
+    esp_netif_pair_mac_ip_t pairs[10];
+    memset(pairs, 0, sizeof(pairs));
+    for (int i = 0; i < num; i++) memcpy(pairs[i].mac, sta_list.sta[i].mac, 6);
+    if (num > 0) esp_netif_dhcps_get_clients_by_mac(s_ap_netif, num, pairs);
 
-    // Tăng buffer size an toàn
-    char buffer[1024];   // đủ lớn cho 10 client
-    int off = 0;
+    char buffer[1024];
+    size_t off = 0;
     buffer[off++] = '[';
     for (int i = 0; i < num; i++) {
-        if (off + 80 >= sizeof(buffer)) {
-            break; // Đảm bảo không tràn
-        }
-        off += snprintf(buffer + off, sizeof(buffer) - off,
+        if (off + 80 >= sizeof(buffer)) break;
+        int w = snprintf(buffer + off, sizeof(buffer) - off,
             "%s{\"mac\":\"%02X:%02X:%02X:%02X:%02X:%02X\",\"ip\":\"" IPSTR "\"}",
             (i > 0) ? "," : "",
             pairs[i].mac[0], pairs[i].mac[1], pairs[i].mac[2],
             pairs[i].mac[3], pairs[i].mac[4], pairs[i].mac[5],
             IP2STR(&pairs[i].ip));
+        if (w < 0 || (size_t)w >= sizeof(buffer) - off) break;
+        off += (size_t)w;
     }
     buffer[off++] = ']';
-    buffer[off] = '\0';
-
-    httpd_resp_set_type(req, "application/json");
-    return httpd_resp_send(req, buffer, off);
+    return httpd_resp_send(req, buffer, (ssize_t)off);
 }
 
-static esp_err_t save_sta_get_handler(httpd_req_t *req) {
-    char query[QUERY_VALUE_LEN * 3];
-    if (!read_post_body(req, query, sizeof(query))) return ESP_OK;
-    if (!check_auth_and_rate(query, req)) return ESP_OK;
+static esp_err_t save_sta_post_handler(httpd_req_t *req) {
+    REQUIRE_AP_SIDE(req);
+    char body[BODY_BUF_LEN];
+    if (!read_post_body(req, body, sizeof(body))) return ESP_OK;
+    if (!check_auth_and_rate(body, req)) return ESP_OK;
 
-    char ssid[SSID_BUF_LEN] = {0};
-    char pass[PASS_BUF_LEN] = {0};
-    char value[QUERY_VALUE_LEN];
+    char ssid[SSID_BUF_LEN + 8];
+    char pass[PASS_BUF_LEN + 8];
+    int rs = apex_form_get(body, "ssid", ssid, sizeof(ssid));
+    int rp = apex_form_get(body, "pass", pass, sizeof(pass));
 
-    esp_err_t res_ssid = httpd_query_key_value(query, "ssid", value, sizeof(value));
-    if (res_ssid == ESP_OK) {
-        url_decode(ssid, sizeof(ssid), value);
-    } else if (res_ssid != ESP_ERR_NOT_FOUND) {
-        httpd_resp_set_status(req, "400 Bad Request");
-        httpd_resp_send(req, "ssid too long", HTTPD_RESP_USE_STRLEN);
-        return ESP_OK;
+    if (rs != 1 || !apex_valid_ssid(ssid)) {
+        return send_text(req, "400 Bad Request", "Tên WiFi phải dài 1-32 byte");
     }
-
-    esp_err_t res_pass = httpd_query_key_value(query, "pass", value, sizeof(value));
-    if (res_pass == ESP_OK) {
-        url_decode(pass, sizeof(pass), value);
-    } else if (res_pass != ESP_ERR_NOT_FOUND) {
-        httpd_resp_set_status(req, "400 Bad Request");
-        httpd_resp_send(req, "pass too long", HTTPD_RESP_USE_STRLEN);
-        return ESP_OK;
+    if (rp == -1 || (pass[0] != '\0' && !apex_valid_wpa_pass(pass))) {
+        return send_text(req, "400 Bad Request", "Mật khẩu WiFi phải dài 8-63 ký tự (hoặc để trống nếu mạng mở)");
     }
+    if (rp == 0) pass[0] = '\0';
 
-    if (strlen(ssid) > 0) {
-        xSemaphoreTake(nvs_mutex, portMAX_DELAY);
-        nvs_set_str(s_nvs_handle, STA_SSID_CONF, ssid);
-        nvs_set_str(s_nvs_handle, STA_PASS_CONF, pass);
-        nvs_commit(s_nvs_handle);
-        xSemaphoreGive(nvs_mutex);
-        ESP_LOGI(TAG, "Saved STA: %s", ssid);
-    }
-
-    httpd_resp_set_type(req, "text/plain");
-    httpd_resp_send(req, "STA Saved. Rebooting...", HTTPD_RESP_USE_STRLEN);
-    vTaskDelay(pdMS_TO_TICKS(1000));
-    esp_restart();
-    return ESP_OK;
+    save_sta_config(ssid, pass);
+    ESP_LOGI(TAG, "Saved STA: %s", ssid);
+    schedule_restart(1500);
+    return send_text(req, "200 OK", "Đã lưu. Thiết bị đang khởi động lại, sẽ mất kết nối vài giây...");
 }
 
-static esp_err_t save_ap_get_handler(httpd_req_t *req) {
-    char query[QUERY_VALUE_LEN * 3];
-    if (!read_post_body(req, query, sizeof(query))) return ESP_OK;
-    if (!check_auth_and_rate(query, req)) return ESP_OK;
+static esp_err_t save_ap_post_handler(httpd_req_t *req) {
+    REQUIRE_AP_SIDE(req);
+    char body[BODY_BUF_LEN];
+    if (!read_post_body(req, body, sizeof(body))) return ESP_OK;
+    if (!check_auth_and_rate(body, req)) return ESP_OK;
 
-    char ssid[SSID_BUF_LEN] = {0};
-    char pass[PASS_BUF_LEN] = {0};
-    char value[QUERY_VALUE_LEN];
+    char ssid[SSID_BUF_LEN + 8];
+    char pass[PASS_BUF_LEN + 8];
+    int rs = apex_form_get(body, "ssid", ssid, sizeof(ssid));
+    int rp = apex_form_get(body, "pass", pass, sizeof(pass));
+    if (rs == -1) return send_text(req, "400 Bad Request", "Tên WiFi quá dài (tối đa 32 byte)");
+    if (rp == -1) return send_text(req, "400 Bad Request", "Mật khẩu quá dài (tối đa 63 ký tự)");
 
-    esp_err_t res_ssid = httpd_query_key_value(query, "ssid", value, sizeof(value));
-    if (res_ssid == ESP_OK) {
-        url_decode(ssid, sizeof(ssid), value);
-        if (strlen(ssid) > 0) strncpy(ap_ssid, ssid, sizeof(ap_ssid) - 1);
-    } else if (res_ssid != ESP_ERR_NOT_FOUND) {
-        httpd_resp_set_status(req, "400 Bad Request");
-        httpd_resp_send(req, "ssid too long", HTTPD_RESP_USE_STRLEN);
-        return ESP_OK;
+    bool change_ssid = (rs == 1 && ssid[0] != '\0');
+    bool change_pass = (rp == 1 && pass[0] != '\0');
+    if (change_ssid && !apex_valid_ssid(ssid)) {
+        return send_text(req, "400 Bad Request", "Tên WiFi phải dài 1-32 byte, không chứa ký tự điều khiển");
+    }
+    if (change_pass && !apex_valid_wpa_pass(pass)) {
+        return send_text(req, "400 Bad Request", "Mật khẩu AP phải dài 8-63 ký tự");
+    }
+    if (change_ssid && strcmp(ssid, ap_ssid) == 0) change_ssid = false;
+    if (change_pass && strcmp(pass, ap_pass) == 0) change_pass = false;
+    if (!change_ssid && !change_pass) {
+        return send_text(req, "200 OK", "Không có thay đổi nào để lưu.");
     }
 
-    esp_err_t res_pass = httpd_query_key_value(query, "pass", value, sizeof(value));
-    if (res_pass == ESP_OK) {
-        url_decode(pass, sizeof(pass), value);
-        if (strlen(pass) >= 8) strncpy(ap_pass, pass, sizeof(ap_pass) - 1);
-    } else if (res_pass != ESP_ERR_NOT_FOUND) {
-        httpd_resp_set_status(req, "400 Bad Request");
-        httpd_resp_send(req, "pass too long", HTTPD_RESP_USE_STRLEN);
-        return ESP_OK;
-    }
-
-    save_config();
-    httpd_resp_set_type(req, "text/plain");
-    httpd_resp_send(req, "AP Saved. Rebooting...", HTTPD_RESP_USE_STRLEN);
-    vTaskDelay(pdMS_TO_TICKS(1000));
-    esp_restart();
-    return ESP_OK;
+    if (change_ssid) copy_str(ap_ssid, sizeof(ap_ssid), ssid);
+    if (change_pass) copy_str(ap_pass, sizeof(ap_pass), pass);
+    save_ap_config();
+    ESP_LOGI(TAG, "Saved AP: %s", ap_ssid);
+    schedule_restart(1500);
+    return send_text(req, "200 OK", "Đã lưu. Thiết bị đang khởi động lại, hãy kết nối lại bằng thông tin mới...");
 }
 
-static esp_err_t save_nat_get_handler(httpd_req_t *req) {
-    char query[QUERY_VALUE_LEN * 2];
-    if (!read_post_body(req, query, sizeof(query))) return ESP_OK;
-    if (!check_auth_and_rate(query, req)) return ESP_OK;
-
-    char value[16];
-    esp_err_t res_slots = httpd_query_key_value(query, "slots", value, sizeof(value));
-    if (res_slots == ESP_OK) {
-        int slots = atoi(value);
-        if (slots >= 64 && slots <= 4096) nat_slots = slots;
-    } else if (res_slots != ESP_ERR_NOT_FOUND) {
-        httpd_resp_set_status(req, "400 Bad Request");
-        httpd_resp_send(req, "slots value too long", HTTPD_RESP_USE_STRLEN);
-        return ESP_OK;
-    }
-
-    esp_err_t res_tcp = httpd_query_key_value(query, "tcp", value, sizeof(value));
-    if (res_tcp == ESP_OK) {
-        int tcp = atoi(value);
-        if (tcp >= 32 && tcp <= 2048) nat_tcp = tcp;
-    } else if (res_tcp != ESP_ERR_NOT_FOUND) {
-        httpd_resp_set_status(req, "400 Bad Request");
-        httpd_resp_send(req, "tcp value too long", HTTPD_RESP_USE_STRLEN);
-        return ESP_OK;
-    }
-
-    if (nat_slots < nat_tcp) nat_slots = nat_tcp;
-    save_config();
-
-    httpd_resp_set_type(req, "text/plain");
-    httpd_resp_send(req, "NAT Saved. Rebooting...", HTTPD_RESP_USE_STRLEN);
-    vTaskDelay(pdMS_TO_TICKS(1000));
-    esp_restart();
-    return ESP_OK;
+// ================= CAPTIVE PORTAL HTTP =================
+static esp_err_t redirect_to_portal(httpd_req_t *req) {
+    httpd_resp_set_status(req, "302 Found");
+    httpd_resp_set_hdr(req, "Location", "http://192.168.4.1/");
+    return httpd_resp_send(req, NULL, 0);
 }
 
-// ================= URI DEFINITIONS =================
-static const httpd_uri_t root_uri = {
-    .uri = "/",
-    .method = HTTP_GET,
-    .handler = root_get_handler,
-};
+static esp_err_t captive_204_handler(httpd_req_t *req) {
+    REQUIRE_AP_SIDE(req);
+    if (is_internet_available()) {
+        httpd_resp_set_status(req, "204 No Content");
+        return httpd_resp_send(req, NULL, 0);
+    }
+    return redirect_to_portal(req);
+}
 
-static const httpd_uri_t token_uri = {
-    .uri = "/get-token",
-    .method = HTTP_GET,
-    .handler = token_get_handler,
-};
+static esp_err_t captive_success_handler(httpd_req_t *req) {
+    REQUIRE_AP_SIDE(req);
+    if (is_internet_available()) {
+        httpd_resp_set_status(req, "404 Not Found");
+        return httpd_resp_send(req, NULL, 0);
+    }
+    return redirect_to_portal(req);
+}
 
-static const httpd_uri_t status_uri = {
-    .uri = "/api/status",
-    .method = HTTP_GET,
-    .handler = status_get_handler,
-};
+static esp_err_t captive_apple_handler(httpd_req_t *req) {
+    REQUIRE_AP_SIDE(req);
+    if (is_internet_available()) {
+        httpd_resp_set_type(req, "text/html");
+        return httpd_resp_send(req, "<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>",
+                               HTTPD_RESP_USE_STRLEN);
+    }
+    return redirect_to_portal(req);
+}
 
-static const httpd_uri_t config_uri = {
-    .uri = "/api/config",
-    .method = HTTP_GET,
-    .handler = config_get_handler,
-};
+static esp_err_t captive_ncsi_handler(httpd_req_t *req) {
+    REQUIRE_AP_SIDE(req);
+    if (is_internet_available()) {
+        httpd_resp_set_type(req, "text/plain");
+        return httpd_resp_send(req, "Microsoft NCSI", HTTPD_RESP_USE_STRLEN);
+    }
+    return redirect_to_portal(req);
+}
 
-static const httpd_uri_t clients_uri = {
-    .uri = "/api/clients",
-    .method = HTTP_GET,
-    .handler = clients_get_handler,
-};
+// Mọi URL lạ: khi chưa có internet thì đưa về trang chính (captive portal), ngược lại trả 404.
+static esp_err_t not_found_handler(httpd_req_t *req, httpd_err_code_t err) {
+    (void)err;
+    if (!request_on_ap_side(req)) {
+        httpd_resp_set_status(req, "403 Forbidden");
+        return httpd_resp_send(req, "Forbidden", HTTPD_RESP_USE_STRLEN);
+    }
+    if (!is_internet_available()) return redirect_to_portal(req);
+    httpd_resp_set_status(req, "404 Not Found");
+    return httpd_resp_send(req, "Not found", HTTPD_RESP_USE_STRLEN);
+}
 
-static const httpd_uri_t save_sta_uri = {
-    .uri = "/save-sta",
-    .method = HTTP_POST,
-    .handler = save_sta_get_handler,
-};
-
-static const httpd_uri_t save_ap_uri = {
-    .uri = "/save-ap",
-    .method = HTTP_POST,
-    .handler = save_ap_get_handler,
-};
-
-static const httpd_uri_t save_nat_uri = {
-    .uri = "/save-nat",
-    .method = HTTP_POST,
-    .handler = save_nat_get_handler,
-};
-
-// Captive portal URIs
-static const httpd_uri_t captive_204_uri = {
-    .uri = "/generate_204",
-    .method = HTTP_GET,
-    .handler = captive_204_handler,
-};
-
-static const httpd_uri_t captive_connectivity_uri = {
-    .uri = "/connectivity-check",
-    .method = HTTP_GET,
-    .handler = captive_204_handler,
-};
-
-static const httpd_uri_t captive_success_uri = {
-    .uri = "/success",
-    .method = HTTP_GET,
-    .handler = captive_success_handler,
-};
-
-static const httpd_uri_t captive_apple_uri = {
-    .uri = "/captive",
-    .method = HTTP_GET,
-    .handler = captive_204_handler,
-};
-
-static const httpd_uri_t captive_hotspot_uri = {
-    .uri = "/hotspot-detect.html",
-    .method = HTTP_GET,
-    .handler = captive_204_handler,
-};
-
-static const httpd_uri_t captive_library_uri = {
-    .uri = "/library/test/success.html",
-    .method = HTTP_GET,
-    .handler = captive_204_handler,
-};
-
-static const httpd_uri_t captive_ncsi_uri = {
-    .uri = "/ncsi.txt",
-    .method = HTTP_GET,
-    .handler = captive_204_handler,
-};
-
-static const httpd_uri_t captive_canonical_uri = {
-    .uri = "/canonical.html",
-    .method = HTTP_GET,
-    .handler = captive_204_handler,
-};
-
-static const httpd_uri_t captive_apple_site_uri = {
-    .uri = "/apple-sd",
-    .method = HTTP_GET,
-    .handler = captive_204_handler,
-};
+// ================= WEB SERVER =================
+static void register_uri(const char *uri, httpd_method_t method, esp_err_t (*handler)(httpd_req_t *)) {
+    httpd_uri_t u = { .uri = uri, .method = method, .handler = handler, .user_ctx = NULL };
+    esp_err_t err = httpd_register_uri_handler(server, &u);
+    if (err != ESP_OK) ESP_LOGE(TAG, "register %s failed: %s", uri, esp_err_to_name(err));
+}
 
 static void start_webserver(void) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.lru_purge_enable = true;
     config.max_uri_handlers = 20;
+    config.max_open_sockets = 7;      // cần CONFIG_LWIP_MAX_SOCKETS >= 7 + 3 (+ socket DNS/HTTP client) - xem sdkconfig.defaults
+    config.stack_size = 6144;
+    config.recv_wait_timeout = 5;
+    config.send_wait_timeout = 5;
 
-    if (httpd_start(&server, &config) == ESP_OK) {
-        httpd_register_uri_handler(server, &root_uri);
-        httpd_register_uri_handler(server, &token_uri);
-        httpd_register_uri_handler(server, &status_uri);
-        httpd_register_uri_handler(server, &config_uri);
-        httpd_register_uri_handler(server, &clients_uri);
-        httpd_register_uri_handler(server, &save_sta_uri);
-        httpd_register_uri_handler(server, &save_ap_uri);
-        httpd_register_uri_handler(server, &save_nat_uri);
-
-        httpd_register_uri_handler(server, &captive_204_uri);
-        httpd_register_uri_handler(server, &captive_connectivity_uri);
-        httpd_register_uri_handler(server, &captive_success_uri);
-        httpd_register_uri_handler(server, &captive_apple_uri);
-        httpd_register_uri_handler(server, &captive_hotspot_uri);
-        httpd_register_uri_handler(server, &captive_library_uri);
-        httpd_register_uri_handler(server, &captive_ncsi_uri);
-        httpd_register_uri_handler(server, &captive_canonical_uri);
-        httpd_register_uri_handler(server, &captive_apple_site_uri);
-
-        ESP_LOGI(TAG, "Web server started with captive portal support");
+    if (httpd_start(&server, &config) != ESP_OK) {
+        ESP_LOGE(TAG, "Không khởi động được web server");
+        return;
     }
+    register_uri("/", HTTP_GET, root_get_handler);
+    register_uri("/login", HTTP_POST, login_post_handler);
+    register_uri("/api/status", HTTP_GET, status_get_handler);
+    register_uri("/api/config", HTTP_GET, config_get_handler);
+    register_uri("/api/clients", HTTP_GET, clients_get_handler);
+    register_uri("/save-sta", HTTP_POST, save_sta_post_handler);
+    register_uri("/save-ap", HTTP_POST, save_ap_post_handler);
+
+    register_uri("/generate_204", HTTP_GET, captive_204_handler);
+    register_uri("/connectivity-check", HTTP_GET, captive_204_handler);
+    register_uri("/captive", HTTP_GET, captive_204_handler);
+    register_uri("/canonical.html", HTTP_GET, captive_204_handler);
+    register_uri("/apple-sd", HTTP_GET, captive_204_handler);
+    register_uri("/success", HTTP_GET, captive_success_handler);
+    register_uri("/hotspot-detect.html", HTTP_GET, captive_apple_handler);
+    register_uri("/library/test/success.html", HTTP_GET, captive_apple_handler);
+    register_uri("/ncsi.txt", HTTP_GET, captive_ncsi_handler);
+
+    httpd_register_err_handler(server, HTTPD_404_NOT_FOUND, not_found_handler);
+    ESP_LOGI(TAG, "Web server started with captive portal support");
 }
 
 // ================= INTERNET CHECK TASK =================
 static void internet_check_task(void *pv) {
+    (void)pv;
     esp_task_wdt_add(NULL);
     for (;;) {
         esp_task_wdt_reset();
 
         bool sta_connected = (xEventGroupGetBits(wifi_event_group) & WIFI_CONNECTED_BIT) != 0;
+        bool reachable = sta_connected ? perform_internet_check() : false;
+        esp_task_wdt_reset();
 
-        if (sta_connected) {
-            internet_reachable = perform_internet_check();
-        } else {
-            internet_reachable = false;
-        }
-
-        bool should_be_online = sta_connected && internet_reachable;
+        // Chỉ bật NAT khi thật sự có internet VÀ RAM không thấp (hysteresis ở vòng lặp chính).
+        bool should_be_online = sta_connected && reachable && !get_mem_pressure();
 
         if (should_be_online) {
-            if (!nat_enabled) {
-                if (!enable_nat()) {
-                    should_be_online = false;
-                }
-            }
+            if (!enable_nat()) should_be_online = false;
         } else {
-            if (nat_enabled) {
-                disable_nat();
-            }
+            disable_nat();
         }
 
         xSemaphoreTake(state_mutex, portMAX_DELAY);
@@ -1181,55 +824,44 @@ static void internet_check_task(void *pv) {
         xSemaphoreGive(state_mutex);
 
         if (should_be_online) {
-            ESP_LOGI(TAG, "✅ Internet: ONLINE");
+            ESP_LOGI(TAG, "Internet: ONLINE");
         } else {
-            ESP_LOGI(TAG, "❌ Internet: OFFLINE (STA=%d, Reachable=%d)", sta_connected, internet_reachable);
+            ESP_LOGI(TAG, "Internet: OFFLINE (STA=%d, Reachable=%d, MemLow=%d)",
+                     sta_connected, reachable, (int)get_mem_pressure());
         }
 
-        // FIX (race no-internet): chờ tối đa 10s (thay vì cứng 60s), NHƯNG
-        // sẽ được đánh thức NGAY nếu có sự kiện STA vừa có IP
-        // (xSemaphoreGive trong wifi_event_handler). Điều này thu hẹp tối đa
-        // cửa sổ mà DNS captive task còn trả lời "chưa có internet" cho các
-        // domain kiểm tra captive-portal của điện thoại/hệ điều hành ngay
-        // sau khi vừa kết nối - đây là nguyên nhân khiến hệ điều hành ghi
-        // nhận "no internet" dù ngay sau đó dashboard đã báo online.
+        // Chờ tối đa 10 s, nhưng được đánh thức ngay khi STA vừa có IP.
         xSemaphoreTake(internet_check_trigger, pdMS_TO_TICKS(10000));
     }
 }
 
 // ================= MAIN =================
-void app_main(void) {
-    ESP_LOGI(TAG, "==========================================");
-    ESP_LOGI(TAG, "APEX ULTRA V22.0.2 - ESP-IDF NAT ROUTER (FIXED)");
-    ESP_LOGI(TAG, "==========================================\n");
+static SemaphoreHandle_t must_mutex(void) {
+    SemaphoreHandle_t m = xSemaphoreCreateMutex();
+    if (m == NULL) { ESP_LOGE(TAG, "Không tạo được mutex"); abort(); }
+    return m;
+}
 
-    state_mutex = xSemaphoreCreateMutex();
-    if (state_mutex == NULL) {
-        ESP_LOGE(TAG, "Failed to create state_mutex");
-        abort();
+static void make_session_token(void) {
+    static const char hex[] = "0123456789abcdef";
+    for (int i = 0; i < TOKEN_LEN; i += 8) {
+        uint32_t r = esp_random();
+        for (int j = 0; j < 8; j++) {
+            session_token[i + j] = hex[(r >> (28 - 4 * j)) & 0xF];
+        }
     }
-    nvs_mutex = xSemaphoreCreateMutex();
-    if (nvs_mutex == NULL) {
-        ESP_LOGE(TAG, "Failed to create nvs_mutex");
-        abort();
-    }
-    rate_limit_mutex = xSemaphoreCreateMutex();
-    if (rate_limit_mutex == NULL) {
-        ESP_LOGE(TAG, "Failed to create rate_limit_mutex");
-        abort();
-    }
-    sta_state_mutex = xSemaphoreCreateMutex();
-    if (sta_state_mutex == NULL) {
-        ESP_LOGE(TAG, "Failed to create sta_state_mutex");
-        abort();
-    }
-    // FIX (race no-internet): binary semaphore, bắt đầu ở trạng thái "rỗng"
-    // (chưa give) - internet_check_task sẽ tự chờ tối đa 10s ở lần đầu.
+    session_token[TOKEN_LEN] = '\0';
+}
+
+void app_main(void) {
+    ESP_LOGI(TAG, "APEX ULTRA V%s - ESP-IDF NAT router", APEX_VERSION);
+
+    state_mutex = must_mutex();
+    nvs_mutex = must_mutex();
+    rate_limit_mutex = must_mutex();
+    sta_state_mutex = must_mutex();
     internet_check_trigger = xSemaphoreCreateBinary();
-    if (internet_check_trigger == NULL) {
-        ESP_LOGE(TAG, "Failed to create internet_check_trigger");
-        abort();
-    }
+    if (internet_check_trigger == NULL) { ESP_LOGE(TAG, "Không tạo được semaphore"); abort(); }
 
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -1237,17 +869,11 @@ void app_main(void) {
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
-
-    nvs_open("apex_v22", NVS_READWRITE, &s_nvs_handle);
+    ESP_ERROR_CHECK(nvs_open(NVS_NAMESPACE, NVS_READWRITE, &s_nvs_handle));
     load_config();
 
-    ESP_LOGI(TAG, "NAT: slots=%d, tcp=%d", (int)nat_slots, (int)nat_tcp);
-
-    uint32_t r1 = esp_random(), r2 = esp_random();
-    snprintf(session_token, sizeof(session_token), "%08lx%08lx", (unsigned long)r1, (unsigned long)r2);
-    ESP_LOGI(TAG, "Session token: %s", session_token);
-    if (strcmp(ap_pass, "12345678") == 0) {
-        ESP_LOGW(TAG, "CANH BAO: dang dung mat khau AP mac dinh, hay doi ngay!");
+    if (apex_ct_equal(ap_pass, APEX_DEFAULT_AP_PASS)) {
+        ESP_LOGW(TAG, "CẢNH BÁO: đang dùng mật khẩu AP mặc định, hãy đổi ngay!");
     }
 
     esp_task_wdt_config_t wdt_config = {
@@ -1255,26 +881,17 @@ void app_main(void) {
         .idle_core_mask = 0,
         .trigger_panic = true,
     };
-    esp_task_wdt_reconfigure(&wdt_config);
+    esp_err_t wdt_err = esp_task_wdt_reconfigure(&wdt_config);
+    if (wdt_err != ESP_OK) ESP_LOGW(TAG, "esp_task_wdt_reconfigure: %s", esp_err_to_name(wdt_err));
     esp_task_wdt_add(NULL);
 
     wifi_init();
-
-    EventBits_t bits = xEventGroupWaitBits(wifi_event_group,
-                                           WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
-                                           pdFALSE,
-                                           pdFALSE,
-                                           pdMS_TO_TICKS(15000));
-
-    if (bits & WIFI_CONNECTED_BIT) {
-        ESP_LOGI(TAG, "Connected to STA");
-    } else {
-        ESP_LOGI(TAG, "No STA configured or connection failed (will keep retrying in background)");
-    }
+    // Token 128 bit tạo SAU khi WiFi đã chạy: lúc này esp_random() mới là RNG phần cứng thật sự.
+    make_session_token();
 
     start_webserver();
 
-    xTaskCreate(internet_check_task, "inet_check", 4096, NULL, 2, NULL);
+    xTaskCreate(internet_check_task, "inet_check", 6144, NULL, 2, NULL);
     xTaskCreate(sta_reconnect_task, "sta_reconnect", 3072, NULL, 2, NULL);
     xTaskCreate(dns_captive_task, "dns_captive", 4096, NULL, 5, NULL);
 
@@ -1286,7 +903,6 @@ void app_main(void) {
         .pull_up_en = 0,
     };
     gpio_config(&io_conf);
-
     for (int i = 0; i < 3; i++) {
         gpio_set_level(2, 0);
         vTaskDelay(pdMS_TO_TICKS(80));
@@ -1294,19 +910,33 @@ void app_main(void) {
         vTaskDelay(pdMS_TO_TICKS(80));
     }
 
-    ESP_LOGI(TAG, "APEX ULTRA Ready! AP: %s", ap_ssid);
-    ESP_LOGI(TAG, "Connect to http://192.168.4.1");
-    ESP_LOGI(TAG, "✅ Captive Portal: DNS + HTTP handlers enabled");
+    ESP_LOGI(TAG, "Sẵn sàng. AP: %s -> http://192.168.4.1 (đăng nhập bằng mật khẩu AP)", ap_ssid);
 
-    while (1) {
+    for (;;) {
         vTaskDelay(pdMS_TO_TICKS(1000));
         esp_task_wdt_reset();
 
         wifi_ap_record_t ap_info;
-        if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+        int rssi = (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) ? ap_info.rssi : -100;
+
+        // Theo dõi RAM với hysteresis: thiếu RAM -> tắt NAT; chỉ bật lại khi RAM hồi phục.
+        uint32_t free_heap = esp_get_free_heap_size();
+        xSemaphoreTake(state_mutex, portMAX_DELAY);
+        last_rssi = rssi;
+        bool prev = mem_pressure;
+        mem_pressure = apex_mem_pressure(prev ? 1 : 0, free_heap) != 0;
+        bool now_p = mem_pressure;
+        xSemaphoreGive(state_mutex);
+
+        if (now_p && !prev) {
+            ESP_LOGW(TAG, "RAM thấp (%u B) - tắt NAT", (unsigned)free_heap);
+            disable_nat();
             xSemaphoreTake(state_mutex, portMAX_DELAY);
-            last_rssi = ap_info.rssi;
+            internet_ok = false;
             xSemaphoreGive(state_mutex);
+        } else if (!now_p && prev) {
+            ESP_LOGI(TAG, "RAM đã hồi phục (%u B)", (unsigned)free_heap);
+            xSemaphoreGive(internet_check_trigger);   // kiểm tra lại ngay và bật NAT
         }
     }
 }

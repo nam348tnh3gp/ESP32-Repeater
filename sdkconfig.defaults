@@ -2,18 +2,21 @@
 CONFIG_LWIP_IP_FORWARD=y
 CONFIG_LWIP_IPV4_NAPT=y
 CONFIG_LWIP_TCPIP_CORE_LOCKING=y
-CONFIG_ESP_TASK_WDT=y
+
+# Số socket lwIP: httpd cần max_open_sockets(7) + 3 socket nội bộ = 10, trong khi DNS server dùng
+# thêm 2 socket và HTTP client kiểm tra internet dùng 1. Mặc định 10 => khi trình duyệt mở đủ
+# kết nối thì socket DNS/HTTP client bị hết chỗ. 16 là mức tối đa của lwIP trong ESP-IDF.
+CONFIG_LWIP_MAX_SOCKETS=16
+
+# Task watchdog: app_main() đặt lại timeout 45 s qua esp_task_wdt_reconfigure().
+CONFIG_ESP_TASK_WDT_INIT=y
 CONFIG_ESP_TASK_WDT_TIMEOUT_S=10
 CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0=y
 CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1=y
-CONFIG_ESP_HTTP_SERVER_ENABLE=y
 
-# FIX: khai báo tường minh dung lượng flash khớp với board esp32dev (4MB)
-# để hết cảnh báo "Flash memory size mismatch detected. Expected 4MB, found 2MB!"
+# Khai báo tường minh dung lượng flash khớp với board esp32dev (4MB).
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 CONFIG_ESPTOOLPY_FLASHSIZE="4MB"
 
-# Dùng bảng phân vùng mặc định "Single factory app, no OTA" của ESP-IDF -
-# đủ dùng cho firmware này (không cần OTA/multi-app), khớp với việc đã bỏ
-# board_build.partitions=default.csv trong platformio.ini.
+# Bảng phân vùng mặc định "Single factory app, no OTA" (khớp platformio.ini).
 CONFIG_PARTITION_TABLE_SINGLE_APP=y

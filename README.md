@@ -1,286 +1,91 @@
 [![Platform: ESP32](https://img.shields.io/badge/Platform-ESP32-blue)](https://www.espressif.com/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
-[![Version](https://img.shields.io/badge/Version-19.9.7-orange)](https://github.com/nam348tnh3gp/ESP32-Repeater)
-[![Arduino](https://img.shields.io/badge/Arduino-ESP32-cyan)](https://www.arduino.cc/)
-# 🛡️ ESP32 NAT Router – V19.9.7 (APEX ULTRA)
+[![Version](https://img.shields.io/badge/Version-22.4.0-orange)](https://github.com/nam348tnh3gp/ESP32-Repeater)
 
-**Category:** Secure Embedded Network OS
-**Platform:** ESP32 (Dual-Core)
-**Architecture:** SMP-aware RTOS + lwIP NAT (NAPT)
+# ESP32 NAT Router – APEX ULTRA (V22.4.0)
 
----
+Firmware biến một board ESP32 thành **repeater WiFi có NAT**: ESP32 kết nối vào mạng WiFi hiện có (STA) và phát lại một mạng riêng (AP) cho các thiết bị khác, kèm trang quản trị web và captive portal.
 
-## 📝 Supported Boards
-
-This firmware has been tested and verified on the following ESP32 boards:
-
-* **ESP32-WROOM-32** (standard Dev Module)
-* **ESP32-WROOM-32U** (external antenna version)
-* **ESP32-WROOM-32D**
-* **ESP32-WROOM-32E**
-* **ESP32-S2 / S3** (limited testing, adjust NAT slots)
-* **ESP32-C5**
-* **ESP32-PICO-D4**
-
-> ⚠️ Notes:
->
-> * Some boards with very limited RAM (< 320KB free heap) may experience NAT table purges more frequently.
-> * For ESP32-S2/S3, dual-core task assignment may need minor tweaks for network task pinning.
+> **Ghi chú trung thực:** đây là firmware cho thiết bị nhúng cỡ nhỏ. Thông lượng NAT của ESP32 chỉ ở mức vài chục Mbps trở xuống, giao diện quản trị chạy **HTTP thuần (không TLS)**, và danh sách board bên dưới chỉ là những chip mà code hướng tới, không phải bảng cam kết đã kiểm thử.
 
 ---
 
-## 🚀 Overview
+## Hai bản cài đặt, một lõi dùng chung
 
-**APEX KERNEL V19.9.7** is a high-performance, security-focused NAT router firmware for ESP32.
-It transforms a single ESP32 board into a **WiFi repeater / access point with NAT**, complete with:
+| Bản | File chính | Dùng khi |
+|---|---|---|
+| **ESP-IDF** (bản chính) | `main/main.c` + `platformio.ini` | Muốn kiểm soát cấu hình SDK (số socket, NAPT…) |
+| Arduino | `ESP_Code.ino` | Muốn build nhanh bằng Arduino IDE / arduino-cli |
 
-* 🔐 Token-based secure control plane
-* ⚡ Real-time WebSocket telemetry dashboard
-* 🧠 Memory-aware NAT lifecycle management
-* 🛡️ Active rate limiting & watchdog protection
+Cả hai dùng chung ba header ở thư mục gốc, nên mọi sửa lỗi logic chỉ làm một nơi:
 
-This firmware is designed for **24/7 stable operation** under constrained hardware conditions.
+* `apex_common.h` – kiểm tra SSID/mật khẩu, so sánh hằng thời gian, JSON escape, parse form, ngưỡng RAM có hysteresis
+* `apex_dns.h` – DNS captive portal + forwarder không chặn
+* `apex_ui.h` – giao diện web (có đăng nhập)
 
----
-
-## ✨ Key Features
-
-### 🌐 Networking
-
-* WiFi **AP + STA concurrent mode**
-* Full **NAPT (Network Address Port Translation)** using lwIP
-* DHCP + DNS captive portal support
-* Automatic internet connectivity detection
+> Khi dùng Arduino IDE, đặt `ESP_Code.ino` và ba file `apex_*.h` **cùng một thư mục** (tên thư mục phải là `ESP_Code`).
 
 ---
 
-### 🔐 Security Layer
+## Tính năng
 
-* **Hardware RNG session token** (`esp_random()`)
-* Token-bound RPC (WebSocket command authentication)
-* **Rate-limited control plane** (anti-spam / anti-flood)
-* WebSocket client limit enforcement
+* WiFi **AP + STA đồng thời**, NAPT của lwIP.
+* **NAT chỉ bật khi thật sự có internet**: kiểm tra bằng HTTP GET `generate_204`, chỉ chấp nhận mã **204** và không theo redirect (captive portal của mạng uplink không còn bị nhận nhầm là "có internet").
+* **Captive portal**: DNS + HTTP handler cho Android / iOS / Windows / Firefox. Khi chưa có internet, các domain kiểm tra captive được trả về IP của thiết bị; khi đã có internet, mọi truy vấn được **forward** lên DNS của mạng uplink (fallback 8.8.8.8).
+* **Tự kết nối lại STA**: thử lại tối đa 5 lần, sau đó thử nền mỗi 30 giây.
+* **Bảo vệ RAM có hysteresis**: tắt NAT khi heap < 26 KB, chỉ bật lại khi heap > 40 KB (không còn bật/tắt liên tục quanh một ngưỡng).
+* **Watchdog** 45 giây trên các task chính (kể cả DNS).
+* Dashboard: RAM, trạng thái internet/NAT, RSSI, danh sách client, cảnh báo mật khẩu mặc định / RAM thấp.
 
----
+## Mô hình bảo mật
 
-### 🧠 Resource Management
+* Trang trạng thái chỉ đọc. **Muốn đổi cấu hình phải đăng nhập** (`POST /login`) bằng **mật khẩu AP**.
+* Token phiên 128 bit (RNG phần cứng) chỉ được trả về sau khi đăng nhập đúng; không còn endpoint trả token công khai.
+* Đăng nhập sai 5 lần → khoá 60 giây. Các lệnh ghi cấu hình giới hạn 3 yêu cầu / 5 giây.
+* **Chỉ phục vụ khách của AP**: mọi request tới địa chỉ IP phía STA (mạng uplink) bị từ chối, DNS chỉ lắng nghe trên IP của AP (không thành open resolver cho mạng uplink).
+* Dữ liệu nhập được kiểm tra phía thiết bị: SSID 1–32 byte, mật khẩu WPA2 8–63 ký tự. SSID rỗng không còn có thể làm hỏng cấu hình AP.
+* AP dùng WPA2-PSK (bản ESP-IDF bỏ chế độ hỗn hợp WPA1).
 
-* **Dynamic NAT pressure control**
+**Giới hạn còn lại:** HTTP không mã hoá nên người cùng AP có thể nghe lén mật khẩu khi bạn đăng nhập; mật khẩu AP mặc định là `12345678` — **hãy đổi ngay** lần đầu dùng (dashboard sẽ cảnh báo).
 
-  * `STABLE` → normal operation
-  * `STRESS` → memory warning
-  * `PURGE` → forced NAT table reset
-* Heap monitoring with critical threshold protection
-* Automatic NAT reinitialization
+## Dùng nhanh
 
----
+1. Nạp firmware, kết nối vào WiFi `APEX_ULTRA` (mật khẩu mặc định `12345678`).
+2. Mở `http://192.168.4.1`, đăng nhập bằng mật khẩu AP.
+3. Nhập WiFi uplink ở mục **Uplink Configuration** → thiết bị tự khởi động lại và kết nối.
+4. Đổi tên/mật khẩu AP ở mục **AP Configuration** (để trống mật khẩu = giữ nguyên).
 
-### ⚙️ Kernel Architecture
+Kích thước bảng NAPT do cấu hình SDK quyết định lúc build, **không chỉnh được lúc chạy** (các ô "NAPT slots" cũ trên giao diện chưa từng có tác dụng nên đã bị gỡ).
 
-* Dual-core task separation:
+## Build
 
-  * Core 0 → Network + NAT engine
-  * Core 1 → DNS + health check
-* SMP-safe atomic variables (`std::atomic`)
-* Multi-task **Watchdog Timer (WDT)** protection
+### ESP-IDF (PlatformIO)
 
----
-
-### 📊 Web Dashboard (APEX UI)
-
-* Real-time stats via WebSocket:
-
-  * Internet status
-  * Heap memory
-  * Uptime
-  * NAT pressure state
-* Connected client list (IP + MAC)
-* STA configuration panel
-
----
-
-## 🧩 System Architecture
-
-```
-                ┌────────────────────┐
-                │   Web Dashboard    │
-                │  (WebSocket UI)    │
-                └─────────┬──────────┘
-                          │
-                ┌─────────▼──────────┐
-                │   Control Plane    │
-                │ Token + RateLimit  │
-                └─────────┬──────────┘
-                          │
-        ┌─────────────────▼─────────────────┐
-        │        APEX NETWORK TASK          │
-        │  - NAT lifecycle                 │
-        │  - Memory pressure control       │
-        │  - Telemetry broadcast           │
-        └─────────────────┬─────────────────┘
-                          │
-        ┌─────────────────▼─────────────────┐
-        │        lwIP NAPT Engine           │
-        │   (ip_napt_enable / init)         │
-        └───────────────────────────────────┘
+```bash
+pip install -r requirements.txt
+rm -rf .pio sdkconfig        # bắt buộc sau khi đổi sdkconfig.defaults
+pio run                      # build
+pio run -t upload            # nạp (PlatformIO tự dò cổng)
 ```
 
----
+`sdkconfig.defaults` đã đặt `CONFIG_LWIP_IPV4_NAPT`, `CONFIG_LWIP_IP_FORWARD` và `CONFIG_LWIP_MAX_SOCKETS=16` (cần cho web server + DNS + HTTP client chạy đồng thời).
 
-## ⚙️ Configuration
+### Arduino
 
-### Default Access Point
+Cài thư viện theo `requirements.arduino` (AsyncTCP, ESPAsyncWebServer, ArduinoJson) và core `esp32:esp32` (CI dùng 3.2.0), chọn board ESP32 rồi biên dịch `ESP_Code.ino`. NAPT cần được bật trong thư viện lwIP của core bạn dùng; nếu `esp_netif_napt_enable` lỗi lúc chạy, hãy dùng bản ESP-IDF.
 
-* SSID: `APEX_ULTRA`
-* Password: `12345678`
-* IP: `192.168.4.1`
+## Kiểm thử
 
----
+```bash
+./tests/run.sh
+```
 
-### Kernel Parameters
+Chạy trên máy host (gcc + python3, có AddressSanitizer/UBSan): unit test của `apex_common.h`, và test chức năng của DNS server thật trên loopback (captive, forwarder không chặn, chống trả lời giả mạo, gói lỗi). Phần phụ thuộc ESP-IDF (WiFi, NAT, web server) chỉ được xác nhận qua CI build và thử trên board thật.
 
-| Parameter                | Value       | Description           |
-| ------------------------ | ----------- | --------------------- |
-| `MAX_AP_CLIENTS`         | 8           | Max connected devices |
-| `MAX_WS_CLIENTS`         | 2           | Max dashboard clients |
-| `WATCHDOG_TIMEOUT`       | 45s         | WDT timeout           |
-| `MEM_CRITICAL_THRESHOLD` | 26000 bytes | NAT purge trigger     |
-| `SESSION_KEY_LEN`        | 16          | Token length          |
+## Board mục tiêu
 
----
+ESP32 (WROOM-32/32U/32D/32E, PICO-D4 đều là cùng một chip), ESP32-S2/S3/C3/C5/C6 ở mức "code hướng tới, chưa kiểm thử đầy đủ". ESP32-S2 và các chip C-series chỉ có **một lõi**; firmware không phụ thuộc vào việc có hai lõi (chỉ `networkTask` bản Arduino được ghim vào core 0).
 
-## 🛠️ Build & Flash
+## Giấy phép
 
-### Requirements
-
-* Arduino IDE / PlatformIO
-* ESP32 Board Package
-* Libraries:
-
-  * `ESPAsyncWebServer`
-  * `AsyncTCP`
-  * `ArduinoJson`
-  * `Preferences` (built-in)
-
----
-
-### Flashing
-
-1. Select board: **ESP32 Dev Module**
-2. Set partition scheme: **Default / Large APP**
-3. Upload firmware
-4. Open Serial Monitor (115200 baud)
-
----
-
-## 🌍 Usage
-
-1. Connect to WiFi: `APEX_ULTRA`
-2. Open browser:
-
-   ```
-   http://192.168.4.1
-   ```
-3. View dashboard
-4. Configure STA (uplink WiFi)
-5. Router auto-reboots and connects
-
----
-
-## 🔄 NAT Lifecycle Logic
-
-The system continuously evaluates memory:
-
-* **Heap > 50KB** → `STABLE`
-* **Heap 26KB–50KB** → `STRESS`
-* **Heap < 26KB** → `PURGE`
-
-  * Disable NAT
-  * Clear NAT table
-  * Reinitialize
-
-This ensures **zero memory leak accumulation** over long uptime.
-
----
-
-## 🔐 Security Model
-
-### Session Token
-
-* Generated at boot using hardware RNG
-* Injected into UI
-* Required for all RPC commands
-
-### Rate Limiting
-
-* Max **3 concurrent control requests**
-* Prevents:
-
-  * Web flooding
-  * WS abuse
-  * Resource exhaustion
-
----
-
-## 📡 Background Tasks
-
-| Task       | Core   | Function           |
-| ---------- | ------ | ------------------ |
-| `APEX_NET` | Core 0 | NAT + telemetry    |
-| `APEX_DNS` | Core 1 | DNS captive portal |
-| `APEX_CHK` | Core 1 | Internet check     |
-| `loop()`   | Any    | WDT keepalive      |
-
----
-
-## 🔁 Reboot Handling
-
-* Stores reboot reason in NVS (`Preferences`)
-* Possible states:
-
-  * `Normal`
-  * `APEX RPC REBOOT`
-  * `Kernel Panic/WDT`
-
----
-
-## ⚠️ Limitations
-
-* Max ~8 clients (hardware constraint)
-* NAT table size limited by ESP32 RAM
-* No HTTPS (HTTP only dashboard)
-* Not suitable for high-bandwidth environments
-
----
-
-## 🧪 Stability Notes
-
-* Designed for **low-power edge networking**
-* Safe for **24/7 operation**
-* Self-healing under:
-
-  * Memory pressure
-  * NAT overflow
-  * Connection instability
-
----
-
-## 📌 Future Improvements
-
-* HTTPS dashboard (TLS)
-* OTA firmware updates
-* Bandwidth shaping / QoS
-* Advanced firewall rules
-* Multi-SSID support
-
----
-
-## 📜 License
-
-MIT License
-
----
-
-## 👨‍💻 Author
-
-Developed as part of a **high-performance embedded networking experiment** on ESP32.
+MIT – xem `LICENSE`.
