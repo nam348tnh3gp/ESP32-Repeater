@@ -22,7 +22,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Run host tests (ASan + UBSan)
-        run: ./tests/run.sh
+        run: bash tests/run.sh
 
   # Job 1: Build ESP-IDF (main.c) bằng PlatformIO
   build-espidf:
