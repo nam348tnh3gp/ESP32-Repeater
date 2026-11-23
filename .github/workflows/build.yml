@@ -10,10 +10,24 @@ name: Build ESP32 NAT Router
 permissions:
   contents: read
 
+env:
+  # Core 4.0.0 là bản đã build thật trên CI (log trước đó). Nâng có chủ đích khi cần.
+  ESP32_CORE_VERSION: "4.0.0"
+
 jobs:
+  # Job 0: test logic dùng chung (DNS, parse form, JSON escape, ...) trên máy host
+  host-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run host tests (ASan + UBSan)
+        run: ./tests/run.sh
+
   # Job 1: Build ESP-IDF (main.c) bằng PlatformIO
   build-espidf:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - name: Checkout code
@@ -59,16 +73,10 @@ jobs:
             .pio/build/esp32dev/partitions.bin
             .pio/build/esp32dev/firmware.bin
 
-      - name: Verify build
-        run: |
-          echo "📦 File merged.bin size:"
-          ls -lh .pio/build/esp32dev/merged.bin
-          echo "✅ Build and merge successful!"
-
-  # Job 2: Build Arduino (ESP_Code.ino) với arduino-cli
+  # Job 2: Build Arduino (ESP_Code.ino) với arduino-cli (độc lập với Job 1)
   build-arduino-ino:
-    needs: build-espidf
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - name: Checkout code
@@ -79,55 +87,35 @@ jobs:
           curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | sh
           echo "$PWD/bin" >> "$GITHUB_PATH"
 
-      - name: Update core index & install ESP32 core
+      - name: Update core index & install ESP32 core (pinned)
         run: |
-          arduino-cli core update-index \
-            --additional-urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
-          arduino-cli core install esp32:esp32 \
-            --additional-urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+          URL=https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+          arduino-cli core update-index --additional-urls "$URL"
+          arduino-cli core install "esp32:esp32@${ESP32_CORE_VERSION}" --additional-urls "$URL"
 
       - name: Update library index
         run: arduino-cli lib update-index
 
-      - name: Install libraries from requirements.arduino (Hybrid - Fixed)
+      - name: Install libraries from requirements.arduino
+        shell: bash
         run: |
-          # Bật chế độ cài từ git
           arduino-cli config set library.enable_unsafe_install true
-
-          # Lọc bỏ dòng comment (#) và dòng trống, sau đó xử lý từng dòng
           grep -vE '^[[:space:]]*#|^[[:space:]]*$' requirements.arduino | while IFS= read -r line; do
-            # Trim khoảng trắng đầu/cuối
-            line_trimmed=$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
-            [[ -z "$line_trimmed" ]] && continue
-
-            # Tách field1 và field2
-            field1=$(echo "$line_trimmed" | awk '{print $1}')
-            field2=$(echo "$line_trimmed" | awk '{print $2}')
-
-            echo "🔧 Processing: '$field1' - '$field2'"
-
+            field1=$(echo "$line" | awk '{print $1}')
+            field2=$(echo "$line" | awk '{print $2}')
+            echo "Processing: '$field1' '$field2'"
             if [[ -n "$field2" && "$field2" =~ ^https?:// ]]; then
-              # Cài từ Git
-              echo "📦 Installing $field1 from Git: $field2"
               arduino-cli lib install --git-url "$field2"
-            elif [[ -n "$field1" ]]; then
-              # Cài từ Library Manager
-              echo "📦 Installing $field1 from Library Manager"
-              arduino-cli lib install "$field1"
             else
-              echo "⚠️ Skipping invalid line: $line_trimmed"
+              arduino-cli lib install "$field1"
             fi
           done
 
-      - name: Verify installed libraries
-        run: |
-          echo "📚 Installed libraries:"
-          ls -la ~/Arduino/libraries/ | grep -E "AsyncTCP|ESPAsyncWebServer|ArduinoJson" || echo "⚠️ Some libraries not found!"
-
-      - name: Prepare sketch folder
+      - name: Prepare sketch folder (sketch + header dùng chung)
         run: |
           mkdir -p build_sketch/ESP_Code
-          cp ESP_Code.ino build_sketch/ESP_Code/ESP_Code.ino
+          cp ESP_Code.ino apex_common.h apex_dns.h apex_ui.h build_sketch/ESP_Code/
+          ls -la build_sketch/ESP_Code
 
       - name: Compile sketch (ESP_Code.ino - Arduino framework)
         run: |
