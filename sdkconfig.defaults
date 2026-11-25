@@ -14,9 +14,18 @@ CONFIG_ESP_TASK_WDT_TIMEOUT_S=10
 CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0=y
 CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1=y
 
-# Khai báo tường minh dung lượng flash khớp với board esp32dev (4MB).
-CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
-CONFIG_ESPTOOLPY_FLASHSIZE="4MB"
+# Dung lượng flash do PlatformIO lấy từ manifest của từng board (esp32dev, esp32-s3-devkitc-1...),
+# không đặt cứng ở đây để khỏi sai với board 2 MB / 8 MB / 16 MB.
 
-# Bảng phân vùng mặc định "Single factory app, no OTA" (khớp platformio.ini).
-CONFIG_PARTITION_TABLE_SINGLE_APP=y
+# Bảng phân vùng do platformio.ini chọn (board_build.partitions = partitions.csv),
+# vì phân vùng app mặc định 1 MB không đủ cho một số chip (vd. ESP32-C6 ~1.07 MB).
+
+# Biên dịch tối ưu kích thước (-Os): giảm đáng kể firmware, không ảnh hưởng chức năng.
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+CONFIG_COMPILER_OPTIMIZATION_ASSERTIONS_SILENT=y
+
+# Giảm thêm kích thước firmware (các tính năng dưới đây không được dùng):
+# - Kiểm tra internet chỉ dùng HTTP thuần => bỏ hỗ trợ HTTPS trong esp_http_client (bớt kéo TLS).
+CONFIG_ESP_HTTP_CLIENT_ENABLE_HTTPS=n
+# - Firmware chỉ dùng IPv4.
+CONFIG_LWIP_IPV6=n

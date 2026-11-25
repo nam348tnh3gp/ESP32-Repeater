@@ -68,7 +68,7 @@ pio run                      # build
 pio run -t upload            # nạp (PlatformIO tự dò cổng)
 ```
 
-`sdkconfig.defaults` đã đặt `CONFIG_LWIP_IPV4_NAPT`, `CONFIG_LWIP_IP_FORWARD` và `CONFIG_LWIP_MAX_SOCKETS=16` (cần cho web server + DNS + HTTP client chạy đồng thời).
+Phân vùng app trong `partitions.csv` rộng 1,875 MB (mặc định của PlatformIO chỉ 1 MB nên ESP32-C6 từng tràn flash); `sdkconfig.defaults` còn bật `-Os`, tắt HTTPS của HTTP client và IPv6 để firmware nhỏ hơn. Ngoài ra `sdkconfig.defaults` đã đặt `CONFIG_LWIP_IPV4_NAPT`, `CONFIG_LWIP_IP_FORWARD` và `CONFIG_LWIP_MAX_SOCKETS=16` (cần cho web server + DNS + HTTP client chạy đồng thời).
 
 ### Arduino
 

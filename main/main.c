@@ -414,7 +414,9 @@ static void wifi_init(void) {
     copy_str((char *)ap_config.ap.ssid, sizeof(ap_config.ap.ssid), ap_ssid);
     copy_str((char *)ap_config.ap.password, sizeof(ap_config.ap.password), ap_pass);
 
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
+    // Chưa cấu hình uplink thì chỉ bật AP: tránh STA quét/kết nối vô ích (driver log cảnh báo mỗi giây)
+    // và tránh tranh chấp sóng với AP. Lưu cấu hình STA luôn khởi động lại nên chế độ được chọn lại.
+    ESP_ERROR_CHECK(esp_wifi_set_mode(sta_configured ? WIFI_MODE_APSTA : WIFI_MODE_AP));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));
 
     if (sta_configured) {
@@ -823,11 +825,17 @@ static void internet_check_task(void *pv) {
         internet_ok = should_be_online;
         xSemaphoreGive(state_mutex);
 
-        if (should_be_online) {
-            ESP_LOGI(TAG, "Internet: ONLINE");
-        } else {
-            ESP_LOGI(TAG, "Internet: OFFLINE (STA=%d, Reachable=%d, MemLow=%d)",
-                     sta_connected, reachable, (int)get_mem_pressure());
+        // Chỉ log khi trạng thái đổi (trước đây log lặp lại mỗi 10 s).
+        static int last_logged = -1;
+        int cur = should_be_online ? 1 : 0;
+        if (cur != last_logged) {
+            last_logged = cur;
+            if (cur) {
+                ESP_LOGI(TAG, "Internet: ONLINE");
+            } else {
+                ESP_LOGI(TAG, "Internet: OFFLINE (STA=%d, Reachable=%d, MemLow=%d)",
+                         sta_connected, reachable, (int)get_mem_pressure());
+            }
         }
 
         // Chờ tối đa 10 s, nhưng được đánh thức ngay khi STA vừa có IP.

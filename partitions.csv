@@ -1,0 +1,7 @@
+# Name,   Type, SubType, Offset,  Size, Flags
+# Bảng phân vùng 1 app (không OTA) nhưng app rộng 1.875 MB thay vì 1 MB mặc định.
+# Bootloader 0x0/0x1000 | bảng phân vùng 0x8000 | app 0x10000 (khớp bước merge_bin trong CI).
+# Vừa với mọi board có flash >= 2 MB.
+nvs,      data, nvs,     0x9000,  0x6000,
+phy_init, data, phy,     0xf000,  0x1000,
+factory,  app,  factory, 0x10000, 0x1E0000,

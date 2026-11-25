@@ -428,11 +428,17 @@ void internetCheckTask(void *pv) {
         }
         internetOK.store(should_be_online);
 
-        if (should_be_online) {
-            Serial.println("✅ Internet: ONLINE");
-        } else {
-            Serial.printf("❌ Internet: OFFLINE (STA=%d, Reachable=%d, MemLow=%d)\n",
-                          sta_connected, reachable, (int)memPressure.load());
+        // Chỉ log khi trạng thái đổi (trước đây log lặp lại mỗi 10 s).
+        static int lastLogged = -1;
+        int cur = should_be_online ? 1 : 0;
+        if (cur != lastLogged) {
+            lastLogged = cur;
+            if (cur) {
+                Serial.println("✅ Internet: ONLINE");
+            } else {
+                Serial.printf("❌ Internet: OFFLINE (STA=%d, Reachable=%d, MemLow=%d)\n",
+                              sta_connected, reachable, (int)memPressure.load());
+            }
         }
         xSemaphoreTake(internetCheckTrigger, pdMS_TO_TICKS(10000));
     }
@@ -481,7 +487,8 @@ void setup() {
 
     WiFi.persistent(false);          // cấu hình do ứng dụng tự lưu trong NVS
     WiFi.setAutoReconnect(false);    // tự quản lý reconnect (wifiEventHandler + staReconnectTask)
-    WiFi.mode(WIFI_AP_STA);
+    // Chưa cấu hình uplink thì chỉ bật AP (STA không làm gì ngoài quét vô ích). Lưu STA luôn restart.
+    WiFi.mode(sta_configured ? WIFI_AP_STA : WIFI_AP);
     WiFi.softAPConfig(AP_IP, AP_GATEWAY, AP_SUBNET);
     WiFi.softAP(ap_ssid.c_str(), ap_pass.c_str(), ap_channel, ap_hidden ? 1 : 0, max_clients);
 
