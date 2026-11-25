@@ -11,7 +11,7 @@ permissions:
   contents: read
 
 env:
-  # Core 4.0.0 là bản đã build thật trên CI (log trước đó). Nâng có chủ đích khi cần.
+  # Core 4.0.0 là bản đã build thật trên CI. Nâng có chủ đích khi cần.
   ESP32_CORE_VERSION: "4.0.0"
 
 jobs:
@@ -24,10 +24,23 @@ jobs:
       - name: Run host tests (ASan + UBSan)
         run: bash tests/run.sh
 
-  # Job 1: Build ESP-IDF (main.c) bằng PlatformIO
+  # Job 1: Build ESP-IDF (main.c) bằng PlatformIO - MỖI CHIP MỘT ENV.
+  # Firmware không dùng chéo được giữa các chip (bootloader offset và chip-id khác nhau).
+  # experimental = chip chưa kiểm chứng: lỗi build không làm đỏ cả workflow.
   build-espidf:
+    name: IDF ${{ matrix.env }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { env: esp32dev, chip: esp32,   bootloader_offset: "0x1000", experimental: false }
+          - { env: esp32s3,  chip: esp32s3, bootloader_offset: "0x0",    experimental: false }
+          - { env: esp32s2,  chip: esp32s2, bootloader_offset: "0x1000", experimental: true }
+          - { env: esp32c3,  chip: esp32c3, bootloader_offset: "0x0",    experimental: true }
+          - { env: esp32c6,  chip: esp32c6, bootloader_offset: "0x0",    experimental: true }
 
     steps:
       - name: Checkout code
@@ -45,38 +58,48 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Build firmware (main.c - ESP-IDF)
-        run: pio run
+      - name: Build firmware (ESP-IDF, ${{ matrix.env }})
+        run: pio run -e ${{ matrix.env }}
 
       - name: Merge 3 files into 1 (merged.bin)
         run: |
-          cd .pio/build/esp32dev/
-          esptool.py --chip esp32 merge_bin -o merged.bin \
-            0x1000 bootloader.bin \
+          cd .pio/build/${{ matrix.env }}/
+          esptool.py --chip ${{ matrix.chip }} merge_bin -o merged.bin \
+            ${{ matrix.bootloader_offset }} bootloader.bin \
             0x8000 partitions.bin \
             0x10000 firmware.bin
-          echo "✅ Merged file created: merged.bin"
           ls -lh merged.bin
 
       - name: Upload merged firmware
         uses: actions/upload-artifact@v4
         with:
-          name: esp32-nat-router
-          path: .pio/build/esp32dev/merged.bin
+          name: esp32-nat-router-${{ matrix.env }}
+          path: .pio/build/${{ matrix.env }}/merged.bin
 
       - name: Upload individual files (optional)
         uses: actions/upload-artifact@v4
         with:
-          name: esp32-individual-files
+          name: esp32-individual-files-${{ matrix.env }}
           path: |
-            .pio/build/esp32dev/bootloader.bin
-            .pio/build/esp32dev/partitions.bin
-            .pio/build/esp32dev/firmware.bin
+            .pio/build/${{ matrix.env }}/bootloader.bin
+            .pio/build/${{ matrix.env }}/partitions.bin
+            .pio/build/${{ matrix.env }}/firmware.bin
 
-  # Job 2: Build Arduino (ESP_Code.ino) với arduino-cli (độc lập với Job 1)
+  # Job 2: Build Arduino (ESP_Code.ino) với arduino-cli - mỗi chip một FQBN, độc lập với Job 1
   build-arduino-ino:
+    name: Arduino ${{ matrix.name }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: esp32,   fqbn: "esp32:esp32:esp32",   experimental: false }
+          - { name: esp32s3, fqbn: "esp32:esp32:esp32s3", experimental: false }
+          - { name: esp32s2, fqbn: "esp32:esp32:esp32s2", experimental: true }
+          - { name: esp32c3, fqbn: "esp32:esp32:esp32c3", experimental: true }
+          - { name: esp32c6, fqbn: "esp32:esp32:esp32c6", experimental: true }
 
     steps:
       - name: Checkout code
@@ -115,17 +138,16 @@ jobs:
         run: |
           mkdir -p build_sketch/ESP_Code
           cp ESP_Code.ino apex_common.h apex_dns.h apex_ui.h build_sketch/ESP_Code/
-          ls -la build_sketch/ESP_Code
 
-      - name: Compile sketch (ESP_Code.ino - Arduino framework)
+      - name: Compile sketch (${{ matrix.fqbn }})
         run: |
           arduino-cli compile \
-            --fqbn esp32:esp32:esp32 \
+            --fqbn ${{ matrix.fqbn }} \
             --output-dir ./build-output \
             build_sketch/ESP_Code
 
       - name: Upload .ino build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: esp_code_ino_build
+          name: esp_code_ino_${{ matrix.name }}
           path: build-output/*
